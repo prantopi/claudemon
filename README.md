@@ -4,7 +4,7 @@
 
 A tiny floating dashboard for your [Claude Code](https://code.claude.com) usage on macOS: tokens, speed, models, subagents and projects, updated every second.
 
-![Claudemon showing sessions, tokens, speed, models, agents, projects and a tokens-per-minute chart](docs/screenshot.png)
+![Claudemon showing sessions, tokens, speed, models, agents, projects, a 24-hour chart with main-session and agent lines, and an agent timeline](docs/screenshot.png)
 
 ## What it shows
 
@@ -16,7 +16,17 @@ A tiny floating dashboard for your [Claude Code](https://code.claude.com) usage 
 | **Models** | Share of today's tokens by model (opus, sonnet, haiku, fable) |
 | **Agents** | Subagents running now and run today, each with its type, task, tokens and run time |
 | **Projects** | The projects that used the most tokens today |
-| **Chart** | Tokens per minute over the last hour. Hover over it to see any minute. |
+| **Chart** | Tokens per minute over the last **1h, 5h or 24h**, with separate lines for your main session and for subagents |
+| **Activity** | The **7d** view: a heatmap of tokens per hour over the last 7 days |
+| **Agent timeline** | One bar per subagent showing when it ran, colored by model. Appears only when agents ran in the chosen range. |
+
+**Hover over anything for details:** every row, any point on the chart, a timeline bar or a heatmap cell. For example, the Tokens row shows exact input, cache and output counts.
+
+### Live signals
+
+- The border glows while subagents are running.
+- Numbers count up smoothly, and new agents fade in.
+- All motion turns off when "Reduce motion" is on in macOS accessibility settings.
 
 ## Install
 
@@ -33,13 +43,20 @@ To start it automatically, add `Claudemon.app` under System Settings → General
 
 ## Controls
 
-- **Drag** anywhere to move it. It remembers its position.
-- **Right-click** to toggle "Always on Top" or quit.
-- **Click the red dot**, or press `q` or `Esc`, to quit.
+| To | Do this |
+|----|---------|
+| Change the time range | Click `1h`, `5h`, `24h` or `7d` above the chart, or press `1` to `4` |
+| Shrink to one line | Double-click the title bar, or press `c`. Do it again to expand. |
+| Change the theme | Right-click → Theme: **Terminal**, **Claude** (warm orange) or **Match System** (light or dark, following macOS) |
+| Keep it above other windows | Right-click → Always on Top |
+| Move it | Drag anywhere |
+| Quit | Click the red dot, press `q` or `Esc`, or right-click → Quit |
+
+Claudemon remembers its position, time range, theme and compact mode between launches.
 
 ## How it works
 
-Claude Code saves every conversation on your Mac in `~/.claude/projects/`, including exact token counts for each reply. Claudemon reads those files, and only the new lines each second. It also checks `~/.claude/sessions/` to see which sessions are running.
+Claude Code saves every conversation on your Mac in `~/.claude/projects/`, including exact token counts for each reply. Claudemon reads the last 7 days of those files at launch, then only the new lines each second. It also checks `~/.claude/sessions/` to see which sessions are running.
 
 **Nothing leaves your Mac.** Claudemon makes no network requests and needs no API key or login.
 

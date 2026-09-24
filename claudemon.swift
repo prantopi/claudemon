@@ -1,4 +1,4 @@
-// claudemon — a tiny floating terminal-style monitor for Claude Code token and agent usage.
+// claudemon — a tiny floating dashboard for Claude Code token and agent usage.
 // Reads the transcripts Claude Code keeps in ~/.claude/projects. Build: ./build.sh  Run: open Claudemon.app
 
 import AppKit
@@ -38,29 +38,49 @@ final class Transcript {
     init(isAgent: Bool) { self.isAgent = isAgent }
 }
 
-struct Agent {
+enum TimeRange: Int, CaseIterable {
+    case hour, fiveHours, day, week
+
+    var label: String { ["1h", "5h", "24h", "7d"][rawValue] }
+    var seconds: TimeInterval { [3600.0, 18000.0, 86400.0, 604800.0][rawValue] }
+    var buckets: Int { [60, 60, 96, 0][rawValue] }
+    var axis: [String] { [["60m", "30m", "now"], ["5h", "2.5h", "now"], ["24h", "12h", "now"], []][rawValue] }
+}
+
+/// One subagent's run: when it was active, on which model, and what it cost in tokens.
+struct Span {
+    let id: String
     let type: String
     let task: String
+    let family: String
+    let start: Date
+    let end: Date
     let tokens: Int
-    let started: Date
     let running: Bool
 }
 
 struct Snapshot {
+    var loaded = false
     var liveSessions = 0, busySessions = 0
     var context = 0, contextProject = ""
-    var today = Usage()
+    var today = Usage(), todayReplies = 0
     var window = 0
-    var windowReset: Date?
-    var rate: [Int] = []
-    var perMinute = 0
-    var models: [(String, Int)] = []
-    var agents: [Agent] = []
-    var agentsToday = 0
-    var projects: [(String, Int)] = []
+    var windowStart: Date?, windowReset: Date?
+    var perMinute = 0, peakPerMinute = 0
+    var lastHour: [Int] = []
+    var range = TimeRange.hour
+    var main: [Double] = [], agentSeries: [Double] = []  // tokens per minute, per bucket, oldest first
+    var bucketSeconds: Double = 60
+    var spans: [Span] = []                             // agents active in the selected range
+    var heat: [[Int]] = []                             // 7 days x 24 hours, oldest day first
+    var heatDays: [Date] = []
+    var models: [(name: String, tokens: Int, replies: Int)] = []
+    var agentsToday: [Span] = []                       // running first, then newest
+    var projects: [(name: String, tokens: Int)] = []
 }
 
 final class Store {
+    static let retention: TimeInterval = 7 * 86400
     private let home = FileManager.default.homeDirectoryForCurrentUser
     private lazy var projectsDir = home.appendingPathComponent(".claude/projects")
     private lazy var sessionsDir = home.appendingPathComponent(".claude/sessions")
@@ -75,17 +95,17 @@ final class Store {
 
     func refresh() {
         let now = Date()
+        let cutoff = now.addingTimeInterval(-Store.retention)
         if now.timeIntervalSince(lastDiscovery) > 3 {
-            discover(since: now.addingTimeInterval(-86400))
+            discover(since: cutoff)
             lastDiscovery = now
         }
         for (path, t) in transcripts {
             let mtime = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date) ?? nil
             guard let mtime, mtime != t.mtime else { continue }
             t.mtime = mtime
-            read(path, t)
+            read(path, t, cutoff: cutoff)
         }
-        let cutoff = now.addingTimeInterval(-86400)
         replies = replies.filter { $0.value.time >= cutoff }
     }
 
@@ -109,7 +129,7 @@ final class Store {
         }
     }
 
-    private func read(_ path: String, _ t: Transcript) {
+    private func read(_ path: String, _ t: Transcript, cutoff: Date) {
         guard let fh = FileHandle(forReadingAtPath: path) else { return }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
@@ -121,10 +141,9 @@ final class Store {
         guard let lastNewline = data.lastIndex(of: 0x0A) else { t.partial = data; return }
         t.partial = data.suffix(from: data.index(after: lastNewline))
         data = data.prefix(upTo: lastNewline)
-        let cutoff = Date().addingTimeInterval(-86400)
         for line in data.split(separator: 0x0A) {
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
-            if t.project == "?", let cwd = obj["cwd"] as? String { t.project = (cwd as NSString).lastPathComponent } // where the session started
+            if t.project == "?", let cwd = obj["cwd"] as? String { t.project = Store.projectName(cwd) } // where the session started
             guard obj["type"] as? String == "assistant",
                   let msg = obj["message"] as? [String: Any],
                   let u = msg["usage"] as? [String: Any],
@@ -143,15 +162,25 @@ final class Store {
         }
     }
 
+    /// A project's folder name. Agents in git worktrees run inside `<project>/.claude/worktrees/<name>`,
+    /// so those count toward the project they belong to.
+    static func projectName(_ cwd: String) -> String {
+        let root = cwd.components(separatedBy: "/.claude/worktrees/").first ?? cwd
+        return (root as NSString).lastPathComponent
+    }
+
     private func liveSessionCount() -> Int {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: sessionsDir.path)) ?? []
         return names.filter { $0.hasSuffix(".json") }.compactMap { pid_t($0.dropLast(5)) }
             .filter { kill($0, 0) == 0 || errno == EPERM }.count
     }
 
-    func snapshot() -> Snapshot {
+    func snapshot(range: TimeRange) -> Snapshot {
         let now = Date()
+        let cal = Calendar.current
         var s = Snapshot()
+        s.loaded = true
+        s.range = range
         s.liveSessions = liveSessionCount()
 
         let mains = transcripts.filter { !$0.value.isAgent }
@@ -161,18 +190,31 @@ final class Store {
             s.contextProject = current.project
         }
 
-        let startOfDay = Calendar.current.startOfDay(for: now)
+        let startOfDay = cal.startOfDay(for: now)
         let all = replies.values.sorted { $0.time < $1.time }
-        let today = all.filter { $0.time >= startOfDay }
-        var byModel: [String: Int] = [:], byProject: [String: Int] = [:], byFile: [String: Int] = [:]
-        for r in today {
+
+        // Per-transcript totals, used for the agent rows and timeline.
+        var perFile: [String: (first: Date, last: Date, tokens: Int, model: String)] = [:]
+        for r in all {
+            if var f = perFile[r.file] {
+                f.last = r.time; f.tokens += r.usage.total; f.model = r.model
+                perFile[r.file] = f
+            } else {
+                perFile[r.file] = (r.time, r.time, r.usage.total, r.model)
+            }
+        }
+
+        var byModel: [String: (tokens: Int, replies: Int)] = [:], byProject: [String: Int] = [:]
+        for r in all where r.time >= startOfDay {
             s.today += r.usage
-            byModel[family(r.model), default: 0] += r.usage.total
+            s.todayReplies += 1
+            let fam = family(r.model)
+            let cur = byModel[fam] ?? (0, 0)
+            byModel[fam] = (cur.tokens + r.usage.total, cur.replies + 1)
             byProject[transcripts[r.file]?.project ?? "?", default: 0] += r.usage.total
         }
-        for r in all { byFile[r.file, default: 0] += r.usage.total }
-        s.models = byModel.sorted { $0.value > $1.value }
-        s.projects = byProject.sorted { $0.value > $1.value }
+        s.models = byModel.map { (name: $0.key, tokens: $0.value.tokens, replies: $0.value.replies) }.sorted { $0.tokens > $1.tokens }
+        s.projects = byProject.map { (name: $0.key, tokens: $0.value) }.sorted { $0.tokens > $1.tokens }
 
         // Estimated 5-hour window: starts at the first reply after a gap of 5h or more.
         var windowStart: Date?
@@ -180,28 +222,65 @@ final class Store {
             windowStart = r.time
         }
         if let ws = windowStart, now < ws.addingTimeInterval(5 * 3600) {
+            s.windowStart = ws
             s.windowReset = ws.addingTimeInterval(5 * 3600)
             s.window = all.filter { $0.time >= ws }.reduce(0) { $0 + $1.usage.total }
         }
 
-        // Tokens per minute over the last hour, oldest first.
-        var buckets = Array(repeating: 0, count: 60)
-        for r in all where now.timeIntervalSince(r.time) < 3600 {
-            let i = 59 - min(59, Int(now.timeIntervalSince(r.time) / 60))
-            buckets[i] += r.usage.total
-            if now.timeIntervalSince(r.time) < 300 { s.perMinute += r.usage.total }
+        // Last hour, per minute: the Speed row and compact mode's sparkline.
+        var minutes = Array(repeating: 0, count: 60)
+        for r in all.reversed() {
+            let age = now.timeIntervalSince(r.time)
+            if age >= 3600 { break }
+            if age < 0 { continue }
+            minutes[59 - Int(age / 60)] += r.usage.total
+            if age < 300 { s.perMinute += r.usage.total }
         }
         s.perMinute /= 5
-        s.rate = buckets
+        s.lastHour = minutes
+        s.peakPerMinute = minutes.max() ?? 0
 
-        let agents = transcripts.filter { $0.value.isAgent && ($0.value.lastReply ?? .distantPast) >= startOfDay }
-        s.agentsToday = agents.count
-        s.agents = agents.map { path, t in
-            let running = now.timeIntervalSince(t.mtime) < 90 && t.lastStop != "end_turn"
-            let started = replies.values.filter { $0.file == path }.map(\.time).min() ?? t.mtime
-            return Agent(type: t.agentType, task: t.agentTask, tokens: byFile[path] ?? 0, started: started, running: running)
+        // Chart: main session and subagents, as tokens per minute per bucket.
+        if range != .week {
+            let n = range.buckets
+            let bucket = range.seconds / Double(n)
+            var main = Array(repeating: 0.0, count: n), agents = main
+            for r in all.reversed() {
+                let age = now.timeIntervalSince(r.time)
+                if age >= range.seconds { break }
+                if age < 0 { continue }
+                let i = n - 1 - min(n - 1, Int(age / bucket))
+                if transcripts[r.file]?.isAgent == true { agents[i] += Double(r.usage.total) } else { main[i] += Double(r.usage.total) }
+            }
+            s.bucketSeconds = bucket
+            s.main = main.map { $0 / (bucket / 60) }
+            s.agentSeries = agents.map { $0 / (bucket / 60) }
         }
-        .sorted { ($0.running ? 1 : 0, $0.started) > ($1.running ? 1 : 0, $1.started) }
+
+        // Heatmap: tokens per hour over the last 7 days.
+        let firstDay = cal.date(byAdding: .day, value: -6, to: startOfDay) ?? startOfDay
+        s.heatDays = (0..<7).map { cal.date(byAdding: .day, value: $0, to: firstDay) ?? firstDay }
+        var heat = Array(repeating: Array(repeating: 0, count: 24), count: 7)
+        for r in all where r.time >= firstDay {
+            let d = cal.dateComponents([.day], from: firstDay, to: cal.startOfDay(for: r.time)).day ?? 0
+            guard (0..<7).contains(d) else { continue }
+            heat[d][cal.component(.hour, from: r.time)] += r.usage.total
+        }
+        s.heat = heat
+
+        // Agents
+        let spans: [Span] = transcripts.compactMap { path, t in
+            guard t.isAgent, let f = perFile[path] else { return nil }
+            let running = now.timeIntervalSince(t.mtime) < 90 && t.lastStop != "end_turn"
+            return Span(id: path, type: t.agentType, task: t.agentTask, family: family(f.model),
+                        start: f.first, end: running ? now : f.last, tokens: f.tokens, running: running)
+        }
+        s.agentsToday = spans.filter { $0.end >= startOfDay }
+            .sorted { ($0.running ? 1 : 0, $0.start) > ($1.running ? 1 : 0, $1.start) }
+        if range != .week {
+            let from = now.addingTimeInterval(-range.seconds)
+            s.spans = spans.filter { $0.end >= from }.sorted { $0.start < $1.start }
+        }
         return s
     }
 
@@ -211,21 +290,65 @@ final class Store {
     }
 }
 
-// MARK: - Rendering
+// MARK: - Theme
+
+struct Palette {
+    let bg, border, fg, agents, dim, label, text, warn, hot, cyan, purple, tooltipBg: NSColor
+}
+
+enum ThemeChoice: Int, CaseIterable {
+    case terminal, claude, system
+    var title: String { ["Terminal", "Claude", "Match System"][rawValue] }
+}
 
 enum Theme {
-    static let bg = NSColor(srgbRed: 0.035, green: 0.045, blue: 0.06, alpha: 0.985)
-    static let border = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 0.55)
-    static let fg = NSColor(srgbRed: 0.55, green: 1.00, blue: 0.62, alpha: 1)
-    static let dim = NSColor(srgbRed: 0.33, green: 0.40, blue: 0.45, alpha: 1)
-    static let label = NSColor(srgbRed: 0.93, green: 0.56, blue: 0.40, alpha: 1)
-    static let cyan = NSColor(srgbRed: 0.35, green: 0.85, blue: 0.95, alpha: 1)
-    static let purple = NSColor(srgbRed: 0.72, green: 0.58, blue: 1.00, alpha: 1)
-    static let warn = NSColor(srgbRed: 1.00, green: 0.78, blue: 0.25, alpha: 1)
-    static let hot = NSColor(srgbRed: 1.00, green: 0.33, blue: 0.33, alpha: 1)
-    static let white = NSColor(srgbRed: 0.86, green: 0.90, blue: 0.93, alpha: 1)
+    static var choice = ThemeChoice.terminal
+
+    static func rgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: r, green: g, blue: b, alpha: a)
+    }
+
+    static let terminal = Palette(
+        bg: rgb(0.035, 0.045, 0.06, 0.985), border: rgb(0.85, 0.47, 0.34, 0.55), fg: rgb(0.55, 1.00, 0.62),
+        agents: rgb(1.00, 0.62, 0.27), dim: rgb(0.33, 0.40, 0.45), label: rgb(0.93, 0.56, 0.40), text: rgb(0.86, 0.90, 0.93),
+        warn: rgb(1.00, 0.78, 0.25), hot: rgb(1.00, 0.33, 0.33), cyan: rgb(0.35, 0.85, 0.95), purple: rgb(0.72, 0.58, 1.00),
+        tooltipBg: rgb(0.10, 0.12, 0.15))
+    static let claude = Palette(
+        bg: rgb(0.10, 0.094, 0.086, 0.985), border: rgb(0.85, 0.47, 0.34, 0.70), fg: rgb(0.85, 0.47, 0.34),
+        agents: rgb(0.91, 0.76, 0.54), dim: rgb(0.46, 0.43, 0.40), label: rgb(0.80, 0.72, 0.64), text: rgb(0.93, 0.90, 0.86),
+        warn: rgb(0.95, 0.76, 0.30), hot: rgb(0.95, 0.36, 0.33), cyan: rgb(0.45, 0.78, 0.85), purple: rgb(0.70, 0.60, 0.95),
+        tooltipBg: rgb(0.16, 0.15, 0.14))
+    static let light = Palette(
+        bg: rgb(0.972, 0.976, 0.968, 0.985), border: rgb(0.78, 0.45, 0.33, 0.55), fg: rgb(0.12, 0.55, 0.31),
+        agents: rgb(0.85, 0.47, 0.02), dim: rgb(0.47, 0.52, 0.50), label: rgb(0.75, 0.34, 0.18), text: rgb(0.11, 0.14, 0.13),
+        warn: rgb(0.72, 0.47, 0.02), hot: rgb(0.77, 0.19, 0.19), cyan: rgb(0.07, 0.53, 0.66), purple: rgb(0.44, 0.28, 0.91),
+        tooltipBg: rgb(1.00, 1.00, 1.00))
+
+    static var systemIsDark: Bool { NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
+    static var p: Palette {
+        switch choice {
+        case .terminal: return terminal
+        case .claude: return claude
+        case .system: return systemIsDark ? terminal : light
+        }
+    }
+
+    static var bg: NSColor { p.bg }
+    static var border: NSColor { p.border }
+    static var fg: NSColor { p.fg }
+    static var agents: NSColor { p.agents }
+    static var dim: NSColor { p.dim }
+    static var label: NSColor { p.label }
+    static var text: NSColor { p.text }
+    static var warn: NSColor { p.warn }
+    static var hot: NSColor { p.hot }
+    static var cyan: NSColor { p.cyan }
+    static var purple: NSColor { p.purple }
+
     static let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
     static let bold = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+    static let small = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .regular)
+    static let smallBold = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
 
     static func model(_ family: String) -> NSColor {
         switch family {
@@ -236,19 +359,31 @@ enum Theme {
         default: return dim
         }
     }
+
+    static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 }
+
+// MARK: - Text helpers
 
 final class Line {
     let s = NSMutableAttributedString()
+    var tip: [String] = []
+    let alpha: CGFloat
+
+    init(alpha: CGFloat = 1) { self.alpha = alpha }
 
     @discardableResult
-    func add(_ text: String, _ color: NSColor = Theme.white, bold: Bool = false) -> Line {
-        s.append(NSAttributedString(string: text, attributes: [.foregroundColor: color, .font: bold ? Theme.bold : Theme.font]))
+    func add(_ text: String, _ color: NSColor = Theme.text, bold: Bool = false) -> Line {
+        let c = alpha < 1 ? color.withAlphaComponent(color.alphaComponent * alpha) : color
+        s.append(NSAttributedString(string: text, attributes: [.foregroundColor: c, .font: bold ? Theme.bold : Theme.font]))
         return self
     }
 
     @discardableResult
     func label(_ text: String) -> Line { add(text.padding(toLength: 10, withPad: " ", startingAt: 0), Theme.label, bold: true) }
+
+    @discardableResult
+    func tip(_ lines: [String]) -> Line { tip = lines; return self }
 }
 
 let sparks = Array("▁▂▃▄▅▆▇█")
@@ -261,131 +396,365 @@ func tokens(_ n: Int) -> String {
     return "\(n)"
 }
 
+let exactFormatter: NumberFormatter = { let f = NumberFormatter(); f.numberStyle = .decimal; return f }()
+func exact(_ n: Int) -> String { exactFormatter.string(from: NSNumber(value: n)) ?? "\(n)" }
+
 func clip(_ s: String, _ n: Int) -> String {
     s.count <= n ? s.padding(toLength: n, withPad: " ", startingAt: 0) : String(s.prefix(n - 1)) + "…"
 }
 
-func elapsed(_ from: Date) -> String {
-    let s = Int(Date().timeIntervalSince(from))
-    return s >= 3600 ? "\(s / 3600)h\(s % 3600 / 60)m" : s >= 60 ? "\(s / 60)m" : "\(s)s"
+func duration(_ seconds: TimeInterval) -> String {
+    let s = Int(max(0, seconds))
+    return s >= 3600 ? "\(s / 3600)h\(s % 3600 / 60)m" : s >= 60 ? "\(s / 60)m\(s % 60)s" : "\(s)s"
 }
+
+func text(_ s: String, _ color: NSColor, _ font: NSFont = Theme.small) -> NSAttributedString {
+    NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color])
+}
+
+// MARK: - View
 
 final class MonitorView: NSView {
     var snap = Snapshot()
+    var range = TimeRange.hour
+    var compact = false
     var spinPhase = true
+    var onRangeChange: ((TimeRange) -> Void)?
+    var onToggleCompact: (() -> Void)?
+
+    // Animation: numbers ease toward their targets; new agents fade in.
+    private var shown: [String: Double] = [:]
+    private var targets: [String: Double] = [:]
+    private var firstSeen: [String: Date] = [:]
+    private var seeded = false
+    private let fadeSeconds = 0.6
+
+    // Hit regions, rebuilt on every draw.
+    private var rowRegions: [(NSRect, [String])] = []
+    private var segmentRects: [(NSRect, TimeRange)] = []
+    private var chartRect = NSRect.zero
+    private var spanRegions: [(NSRect, Span)] = []
+    private var heatRegions: [(NSRect, Int, Int)] = []
+    private var mouse: NSPoint?
+
     let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
     let hm: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+    let dayName: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE"; return f }()
+    let dayLong: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d MMM"; return f }()
+
     let pad = NSSize(width: 14, height: 10)
     let titleHeight: CGFloat = 24
+    let gap: CGFloat = 12, headerH: CGFloat = 20, subH: CGFloat = 14, plotH: CGFloat = 56, axisH: CGFloat = 14
+    let laneH: CGFloat = 7, laneGap: CGFloat = 3, maxLanes = 6
+    let cellH: CGFloat = 10, cellGap: CGFloat = 2
+    lazy var rowH: CGFloat = ceil(Line().add("Xy").s.size().height) + 3
 
     override var isFlipped: Bool { true }
 
-    func body() -> NSAttributedString {
+    // MARK: State updates
+
+    func apply(_ s: Snapshot) {
+        let now = Date()
+        if s.loaded && !seeded {
+            // Agents that already existed at launch appear without a fade.
+            for a in s.agentsToday { firstSeen[a.id] = .distantPast }
+            seeded = true
+        }
+        for a in s.agentsToday where firstSeen[a.id] == nil { firstSeen[a.id] = Theme.reduceMotion ? .distantPast : now }
+        snap = s
+        targets = ["today": Double(s.today.total), "window": Double(s.window), "speed": Double(s.perMinute),
+                   "peak": Double(s.peakPerMinute), "ctx": Double(s.context)]
+        for (k, v) in targets where shown[k] == nil || Theme.reduceMotion { shown[k] = v }
+    }
+
+    /// Advances animations by one frame. Returns true while anything is still moving.
+    func stepAnimation() -> Bool {
+        var moving = false
+        for (k, target) in targets {
+            let cur = shown[k] ?? target
+            let diff = target - cur
+            if abs(diff) <= max(1, abs(target) * 0.002) {
+                shown[k] = target
+            } else {
+                shown[k] = cur + diff * 0.25
+                moving = true
+            }
+        }
+        let now = Date()
+        if firstSeen.values.contains(where: { now.timeIntervalSince($0) < fadeSeconds }) { moving = true }
+        return moving
+    }
+
+    var needsAnimation: Bool {
+        if Theme.reduceMotion { return false }
+        let now = Date()
+        return targets.contains { abs(($0.value) - (shown[$0.key] ?? $0.value)) > max(1, abs($0.value) * 0.002) }
+            || firstSeen.values.contains { now.timeIntervalSince($0) < fadeSeconds }
+    }
+
+    private func num(_ key: String, _ fallback: Int) -> Int { Int((shown[key] ?? Double(fallback)).rounded()) }
+
+    private func fade(_ id: String) -> CGFloat {
+        guard let seen = firstSeen[id] else { return 1 }
+        return CGFloat(min(1, Date().timeIntervalSince(seen) / fadeSeconds))
+    }
+
+    var runningAgents: Int { snap.agentsToday.filter(\.running).count }
+    var showTimeline: Bool { range != .week && !snap.spans.isEmpty }
+    var hasAgentSeries: Bool { snap.agentSeries.contains { $0 > 0 } }
+
+    // MARK: Rows
+
+    func rows() -> [Line] {
         let s = snap
+        guard s.loaded else { return [Line().add("Reading Claude Code logs…", Theme.dim)] }
         var lines: [Line] = []
 
+        let ctx = num("ctx", s.context)
         let ses = Line().label("Sessions").add("\(s.liveSessions)", Theme.fg, bold: true).add(" live", Theme.dim)
         if s.busySessions > 0 { ses.add(" · ", Theme.dim).add("\(s.busySessions) busy", Theme.warn) }
-        if s.context > 0 {
-            ses.add(" · ctx ", Theme.dim).add(tokens(s.context)).add(" \(clip(s.contextProject, 16).trimmingCharacters(in: .whitespaces))", Theme.dim)
+        if ctx > 0 {
+            ses.add(" · ctx ", Theme.dim).add(tokens(ctx)).add(" \(clip(s.contextProject, 16).trimmingCharacters(in: .whitespaces))", Theme.dim)
         }
+        ses.tip(["Sessions",
+                 "\(s.liveSessions) running now, \(s.busySessions) active in the last 20s",
+                 s.context > 0 ? "Latest conversation: \(exact(s.context)) tokens of context (\(s.contextProject))" : "No conversation yet"])
         lines.append(ses)
 
-        let tok = Line().label("Tokens").add("today ", Theme.dim).add(tokens(s.today.total), Theme.fg, bold: true)
+        let usageTip = ["Tokens today (\(exact(s.todayReplies)) replies)",
+                        "Input:        \(exact(s.today.input))",
+                        "Cache writes: \(exact(s.today.cacheWrite))",
+                        "Cache reads:  \(exact(s.today.cacheRead))",
+                        "Output:       \(exact(s.today.output))",
+                        s.windowStart.map { "5h window since \(hm.string(from: $0)) (estimate): \(exact(s.window))" } ?? "No active 5h window"]
+        let tok = Line().label("Tokens").add("today ", Theme.dim).add(tokens(num("today", s.today.total)), Theme.fg, bold: true)
         if let reset = s.windowReset {
-            tok.add("  5h ", Theme.dim).add(tokens(s.window), Theme.fg, bold: true).add(" · resets ~\(hm.string(from: reset))", Theme.dim)
+            tok.add("  5h ", Theme.dim).add(tokens(num("window", s.window)), Theme.fg, bold: true).add(" · resets ~\(hm.string(from: reset))", Theme.dim)
         }
-        lines.append(tok)
+        lines.append(tok.tip(usageTip))
         lines.append(Line().add("          ").add("in ", Theme.dim).add(tokens(s.today.input + s.today.cacheWrite))
             .add("  out ", Theme.dim).add(tokens(s.today.output))
-            .add("  cache ", Theme.dim).add(tokens(s.today.cacheRead)))
+            .add("  cache ", Theme.dim).add(tokens(s.today.cacheRead)).tip(usageTip))
 
-        lines.append(Line().label("Speed").add(tokens(s.perMinute), s.perMinute > 0 ? Theme.fg : Theme.dim, bold: true)
-            .add("/min now", Theme.dim).add(" · peak ", Theme.dim).add(tokens(s.rate.max() ?? 0)).add("/min", Theme.dim))
+        let speed = num("speed", s.perMinute)
+        lines.append(Line().label("Speed").add(tokens(speed), speed > 0 ? Theme.fg : Theme.dim, bold: true)
+            .add("/min now", Theme.dim).add(" · peak ", Theme.dim).add(tokens(num("peak", s.peakPerMinute))).add("/min", Theme.dim)
+            .tip(["Speed",
+                  "Now: \(exact(s.perMinute)) tokens/min (average of the last 5 minutes)",
+                  "Peak: \(exact(s.peakPerMinute)) tokens/min (busiest minute in the last hour)"]))
 
-        let total = max(1, s.models.reduce(0) { $0 + $1.1 })
+        let total = max(1, s.models.reduce(0) { $0 + $1.tokens })
         let mdl = Line().label("Models")
         if s.models.isEmpty {
             mdl.add("no replies today", Theme.dim)
         } else {
             var used = 0
-            for (i, (fam, n)) in s.models.enumerated() {
-                let w = i == s.models.count - 1 ? 18 - used : max(1, n * 18 / total)
-                mdl.add(String(repeating: "█", count: max(0, w)), Theme.model(fam))
+            for (i, m) in s.models.enumerated() {
+                let w = i == s.models.count - 1 ? 18 - used : max(1, m.tokens * 18 / total)
+                mdl.add(String(repeating: "█", count: max(0, w)), Theme.model(m.name))
                 used += w
             }
-            for (fam, n) in s.models.prefix(3) { mdl.add(" \(fam) ", Theme.model(fam)).add(n * 100 < total ? "<1%" : "\(n * 100 / total)%", Theme.dim) }
+            for m in s.models.prefix(3) {
+                mdl.add(" \(m.name) ", Theme.model(m.name)).add(m.tokens * 100 < total ? "<1%" : "\(m.tokens * 100 / total)%", Theme.dim)
+            }
         }
-        lines.append(mdl)
+        lines.append(mdl.tip(["Models today"] + s.models.map {
+            "\($0.name): \(exact($0.tokens)) tokens · \($0.replies) replies · \($0.tokens * 100 < total ? "<1" : "\($0.tokens * 100 / total)")%"
+        }))
 
-        let running = s.agents.filter(\.running).count
-        lines.append(Line().label("Agents").add("\(running)", running > 0 ? Theme.warn : Theme.dim, bold: true)
-            .add(" running", Theme.dim).add(" · ", Theme.dim).add("\(s.agentsToday)").add(" today", Theme.dim))
-        for a in s.agents.prefix(4) {
+        lines.append(Line().label("Agents").add("\(runningAgents)", runningAgents > 0 ? Theme.warn : Theme.dim, bold: true)
+            .add(" running", Theme.dim).add(" · ", Theme.dim).add("\(s.agentsToday.count)").add(" today", Theme.dim)
+            .tip(["Subagents", "\(runningAgents) running now", "\(s.agentsToday.count) run today"]))
+        for a in s.agentsToday.prefix(4) {
             let icon = a.running ? (spinPhase ? "◐ " : "◓ ") : "✓ "
-            lines.append(Line().add("  ").add(icon, a.running ? Theme.warn : Theme.fg)
-                .add(clip(a.type, 15), a.running ? Theme.white : Theme.dim)
+            let row = Line(alpha: fade(a.id)).add("  ").add(icon, a.running ? Theme.warn : Theme.fg)
+                .add(clip(a.type, 15), a.running ? Theme.text : Theme.dim)
                 .add(" " + clip(a.task, 22), Theme.dim)
-                .add(" " + tokens(a.tokens).padding(toLength: 6, withPad: " ", startingAt: 0), a.running ? Theme.white : Theme.dim)
-                .add(a.running ? elapsed(a.started) : "", Theme.warn))
+                .add(" " + tokens(a.tokens).padding(toLength: 6, withPad: " ", startingAt: 0), a.running ? Theme.text : Theme.dim)
+                .add(a.running ? duration(Date().timeIntervalSince(a.start)) : "", Theme.warn)
+            lines.append(row.tip([a.type, a.task.isEmpty ? "(no description)" : a.task,
+                                  "Model: \(a.family) · \(exact(a.tokens)) tokens",
+                                  a.running ? "Running for \(duration(Date().timeIntervalSince(a.start)))"
+                                            : "Ran \(hm.string(from: a.start))–\(hm.string(from: a.end)) (\(duration(a.end.timeIntervalSince(a.start))))"]))
         }
 
         if !s.projects.isEmpty {
             let top = Line().label("Projects")
-            for (i, (name, n)) in s.projects.prefix(2).enumerated() {
+            for (i, p) in s.projects.prefix(2).enumerated() {
                 if i > 0 { top.add(" · ", Theme.dim) }
-                top.add(clip(name, 16).trimmingCharacters(in: .whitespaces)).add(" \(tokens(n))", Theme.dim)
+                top.add(clip(p.name, 16).trimmingCharacters(in: .whitespaces)).add(" \(tokens(p.tokens))", Theme.dim)
             }
-            lines.append(top)
+            lines.append(top.tip(["Projects today"] + s.projects.prefix(6).map { "\($0.name): \(exact($0.tokens)) tokens" }))
         }
+        return lines
+    }
 
+    func compactSummary() -> NSAttributedString {
+        let l = Line()
+        guard snap.loaded else { return l.add("loading…", Theme.dim).s }
+        l.add(tokens(num("speed", snap.perMinute)), Theme.fg, bold: true).add("/min ", Theme.dim)
+        let recent = snap.lastHour.suffix(20)
+        let peak = max(1, recent.max() ?? 1)
+        for v in recent { l.add(v == 0 ? "·" : String(sparks[min(7, v * 8 / (peak + 1))]), v == 0 ? Theme.dim : Theme.fg) }
+        l.add("  \(snap.liveSessions) live", Theme.dim)
+        if runningAgents > 0 { l.add("  \(spinPhase ? "◐" : "◓") \(runningAgents) agent\(runningAgents == 1 ? "" : "s")", Theme.warn) }
+        return l.s
+    }
 
-        let out = NSMutableAttributedString()
-        for (i, l) in lines.enumerated() {
-            if i > 0 { out.append(NSAttributedString(string: "\n")) }
-            out.append(l.s)
+    // MARK: Layout
+
+    private func lanes() -> [(Span, Int)] {
+        var ends: [Date] = []
+        var out: [(Span, Int)] = []
+        for s in snap.spans {
+            if let free = ends.firstIndex(where: { $0 < s.start }) {
+                ends[free] = s.end; out.append((s, free))
+            } else if ends.count < maxLanes {
+                ends.append(s.end); out.append((s, ends.count - 1))
+            } else {
+                let i = ends.indices.min { ends[$0] < ends[$1] } ?? 0
+                ends[i] = max(ends[i], s.end); out.append((s, i))
+            }
         }
-        let para = NSMutableParagraphStyle()
-        para.lineSpacing = 2
-        out.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: out.length))
         return out
     }
 
-    // Line chart under the text: header, plot, axis labels.
-    let chartGap: CGFloat = 12, chartHeader: CGFloat = 16, chartPlot: CGFloat = 56, chartAxis: CGFloat = 14
-    var chartBlock: CGFloat { chartGap + chartHeader + chartPlot + chartAxis }
-    var chartRect = NSRect.zero
-    var hoverIndex: Int?
-    let small = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .regular)
+    private var chartBlockHeight: CGFloat {
+        gap + headerH + (range == .week ? 7 * (cellH + cellGap) + axisH : subH + plotH + axisH)
+    }
+
+    private var timelineHeight: CGFloat {
+        let n = (lanes().map(\.1).max() ?? -1) + 1
+        return gap + headerH + CGFloat(n) * (laneH + laneGap)
+    }
+
+    private let dots = Line().add("● ", Theme.hot).add("● ", Theme.warn).add("●", Theme.rgb(0.35, 0.80, 0.45)).s
 
     func fittingSize() -> NSSize {
-        let b = body().size()
-        return NSSize(width: ceil(b.width) + pad.width * 2 + 8,
-                      height: ceil(b.height) + titleHeight + pad.height * 2 + chartBlock)
+        if compact {
+            return NSSize(width: 10 + ceil(dots.size().width) + 12 + ceil(compactSummary().size().width) + 12, height: titleHeight)
+        }
+        let lines = rows()
+        let width = lines.map { ceil($0.s.size().width) }.max() ?? 0
+        var height = titleHeight + pad.height + CGFloat(lines.count) * rowH + chartBlockHeight + pad.height
+        if showTimeline { height += timelineHeight }
+        return NSSize(width: max(width + pad.width * 2 + 8, 400), height: height)
     }
 
-    func text(_ s: String, _ color: NSColor, _ font: NSFont? = nil) -> NSAttributedString {
-        NSAttributedString(string: s, attributes: [.font: font ?? small, .foregroundColor: color])
-    }
+    // MARK: Drawing
 
-    func drawChart(top: CGFloat) {
-        let data = snap.rate
-        let left = pad.width, width = bounds.width - pad.width * 2
-        text("Tokens per minute", Theme.white).draw(at: NSPoint(x: left, y: top))
-        let span = NSMutableAttributedString(attributedString: text("max ", Theme.dim))
-        span.append(text(tokens(data.max() ?? 0), Theme.white))
-        span.draw(at: NSPoint(x: left + width - span.size().width, y: top))
+    override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 9, yRadius: 9)
+        Theme.bg.setFill()
+        shape.fill()
 
-        let r = NSRect(x: left, y: top + chartHeader, width: width, height: chartPlot)
-        chartRect = r
-        guard data.count > 1 else { return }
-        let peak = CGFloat(max(1, data.max() ?? 1))
-        func point(_ i: Int) -> NSPoint {
-            NSPoint(x: r.minX + r.width * CGFloat(i) / CGFloat(data.count - 1),
-                    y: r.maxY - (r.height - 4) * CGFloat(data[i]) / peak)
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        Theme.border.withAlphaComponent(0.07).setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: titleHeight).fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        // Border: glows while agents are running.
+        let glowing = runningAgents > 0
+        if glowing {
+            let inner = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 8, yRadius: 8)
+            Theme.agents.withAlphaComponent(Theme.reduceMotion || spinPhase ? 0.35 : 0.15).setStroke()
+            inner.lineWidth = 3
+            inner.stroke()
+        }
+        (glowing ? Theme.agents.withAlphaComponent(0.9) : Theme.border).setStroke()
+        shape.lineWidth = 1
+        shape.stroke()
+
+        dots.draw(at: NSPoint(x: 10, y: (titleHeight - dots.size().height) / 2))
+        if compact {
+            let summary = compactSummary()
+            summary.draw(at: NSPoint(x: 10 + dots.size().width + 12, y: (titleHeight - summary.size().height) / 2))
+            return
+        }
+        Theme.border.withAlphaComponent(0.3).setFill()
+        NSRect(x: 0, y: titleHeight, width: bounds.width, height: 1).fill()
+        let title = text("claudemon", Theme.dim, Theme.font)
+        title.draw(at: NSPoint(x: 10 + dots.size().width + 12, y: (titleHeight - title.size().height) / 2))
+        let clk = text(clock.string(from: Date()), Theme.dim, Theme.font)
+        clk.draw(at: NSPoint(x: bounds.width - clk.size().width - 12, y: (titleHeight - clk.size().height) / 2))
+
+        rowRegions = []
+        var y = titleHeight + pad.height
+        for line in rows() {
+            line.s.draw(at: NSPoint(x: pad.width, y: y))
+            if !line.tip.isEmpty { rowRegions.append((NSRect(x: 0, y: y - 1, width: bounds.width, height: rowH), line.tip)) }
+            y += rowH
         }
 
-        // Recessive grid: baseline plus half and full scale.
+        y += gap
+        drawChartHeader(top: y)
+        y += headerH
+        spanRegions = []
+        heatRegions = []
+        if range == .week {
+            chartRect = .zero
+            drawHeatmap(top: y)
+        } else {
+            drawLineChart(top: y)
+            y += subH + plotH + axisH
+            if showTimeline { drawTimeline(top: y + gap) }
+        }
+        drawTooltip()
+    }
+
+    private func drawChartHeader(top: CGFloat) {
+        let left = pad.width, right = bounds.width - pad.width
+        let title = range == .week ? "Activity, last 7 days" : "Tokens per minute"
+        text(title, Theme.text, Theme.font).draw(at: NSPoint(x: left, y: top + 2))
+
+        // Range switch
+        segmentRects = []
+        let labels = TimeRange.allCases.map { text($0.label, Theme.text, Theme.smallBold) }
+        let segW = labels.map { ceil($0.size().width) + 14 }
+        let total = segW.reduce(0, +)
+        let box = NSRect(x: right - total, y: top + 1, width: total, height: 16)
+        let container = NSBezierPath(roundedRect: box, xRadius: 5, yRadius: 5)
+        Theme.dim.withAlphaComponent(0.12).setFill()
+        container.fill()
+        var x = box.minX
+        for (i, r) in TimeRange.allCases.enumerated() {
+            let seg = NSRect(x: x, y: box.minY, width: segW[i], height: box.height)
+            if r == range {
+                Theme.label.withAlphaComponent(0.28).setFill()
+                NSBezierPath(roundedRect: seg.insetBy(dx: 1, dy: 1), xRadius: 4, yRadius: 4).fill()
+            }
+            let t = text(r.label, r == range ? Theme.text : Theme.dim, Theme.smallBold)
+            t.draw(at: NSPoint(x: seg.midX - t.size().width / 2, y: seg.midY - t.size().height / 2))
+            segmentRects.append((seg, r))
+            x += segW[i]
+        }
+    }
+
+    private func drawLineChart(top: CGFloat) {
+        let left = pad.width, width = bounds.width - pad.width * 2
+        let main = snap.main, agents = snap.agentSeries
+        let peak = max(1, (main + agents).max() ?? 1)
+
+        // Legend (only needed with two series) and scale.
+        if hasAgentSeries {
+            var x = left
+            for (name, color) in [("Main session", Theme.fg), ("Agents", Theme.agents)] {
+                color.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x, y: top + 4, width: 7, height: 7)).fill()
+                let t = text(name, Theme.dim)
+                t.draw(at: NSPoint(x: x + 10, y: top))
+                x += 10 + t.size().width + 12
+            }
+        }
+        let scale = NSMutableAttributedString(attributedString: text("max ", Theme.dim))
+        scale.append(text(tokens(Int(peak)) + "/min", Theme.text))
+        scale.draw(at: NSPoint(x: left + width - scale.size().width, y: top))
+
+        let r = NSRect(x: left, y: top + subH, width: width, height: plotH)
+        chartRect = r
+        guard main.count > 1 else { return }
+
         for f in [0.0, 0.5, 1.0] as [CGFloat] {
             let y = (r.minY + 4 + (r.height - 4) * f).rounded() + 0.5
             let g = NSBezierPath()
@@ -396,57 +765,181 @@ final class MonitorView: NSView {
             g.stroke()
         }
 
-        let line = NSBezierPath()
-        line.move(to: point(0))
-        for i in 1..<data.count { line.line(to: point(i)) }
-        let area = line.copy() as! NSBezierPath
+        func point(_ data: [Double], _ i: Int) -> NSPoint {
+            NSPoint(x: r.minX + r.width * CGFloat(i) / CGFloat(data.count - 1),
+                    y: r.maxY - (r.height - 4) * CGFloat(data[i] / peak))
+        }
+        func path(_ data: [Double]) -> NSBezierPath {
+            let p = NSBezierPath()
+            p.move(to: point(data, 0))
+            for i in 1..<data.count { p.line(to: point(data, i)) }
+            p.lineWidth = 2
+            p.lineJoinStyle = .round
+            p.lineCapStyle = .round
+            return p
+        }
+
+        // Agents first, so the main session's line stays on top where they overlap.
+        if hasAgentSeries {
+            Theme.agents.setStroke()
+            path(agents).stroke()
+        }
+        let mainLine = path(main)
+        let area = mainLine.copy() as! NSBezierPath
         area.line(to: NSPoint(x: r.maxX, y: r.maxY))
         area.line(to: NSPoint(x: r.minX, y: r.maxY))
         area.close()
-        NSGradient(starting: Theme.fg.withAlphaComponent(0.30), ending: Theme.fg.withAlphaComponent(0.0))?
-            .draw(in: area, angle: 90)
-        line.lineWidth = 2
-        line.lineJoinStyle = .round
-        line.lineCapStyle = .round
+        NSGradient(starting: Theme.fg.withAlphaComponent(0.28), ending: Theme.fg.withAlphaComponent(0))?.draw(in: area, angle: 90)
         Theme.fg.setStroke()
-        line.stroke()
+        mainLine.stroke()
 
-        func dot(_ p: NSPoint) {
+        func dot(_ p: NSPoint, _ color: NSColor) {
             Theme.bg.setFill()
             NSBezierPath(ovalIn: NSRect(x: p.x - 6, y: p.y - 6, width: 12, height: 12)).fill()
-            Theme.fg.setFill()
+            color.setFill()
             NSBezierPath(ovalIn: NSRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8)).fill()
         }
 
         let axisY = r.maxY + 3
-        text("60m", Theme.dim).draw(at: NSPoint(x: r.minX, y: axisY))
-        let mid = text("30m", Theme.dim)
-        mid.draw(at: NSPoint(x: r.midX - mid.size().width / 2, y: axisY))
-        let now = text("now", Theme.dim)
-        now.draw(at: NSPoint(x: r.maxX - now.size().width, y: axisY))
+        let labels = range.axis
+        if labels.count == 3 {
+            text(labels[0], Theme.dim).draw(at: NSPoint(x: r.minX, y: axisY))
+            let mid = text(labels[1], Theme.dim)
+            mid.draw(at: NSPoint(x: r.midX - mid.size().width / 2, y: axisY))
+            let end = text(labels[2], Theme.dim)
+            end.draw(at: NSPoint(x: r.maxX - end.size().width, y: axisY))
+        }
 
-        guard let i = hoverIndex, data.indices.contains(i) else { dot(point(data.count - 1)); return }
-        let p = point(i)
-        let cross = NSBezierPath()
-        cross.move(to: NSPoint(x: p.x.rounded() + 0.5, y: r.minY)); cross.line(to: NSPoint(x: p.x.rounded() + 0.5, y: r.maxY))
-        cross.lineWidth = 1
-        Theme.white.withAlphaComponent(0.35).setStroke()
-        cross.stroke()
-        dot(p)
+        if let i = chartIndex() {
+            let p = point(main, i)
+            let cross = NSBezierPath()
+            cross.move(to: NSPoint(x: p.x.rounded() + 0.5, y: r.minY)); cross.line(to: NSPoint(x: p.x.rounded() + 0.5, y: r.maxY))
+            cross.lineWidth = 1
+            Theme.text.withAlphaComponent(0.35).setStroke()
+            cross.stroke()
+            dot(p, Theme.fg)
+            if hasAgentSeries { dot(point(agents, i), Theme.agents) }
+        } else {
+            dot(point(main, main.count - 1), Theme.fg)
+        }
+    }
 
-        let when = hm.string(from: Date().addingTimeInterval(-Double(data.count - 1 - i) * 60))
-        let tip = NSMutableAttributedString(attributedString: text(when + "  ", Theme.dim))
-        tip.append(text(tokens(data[i]) + " tokens", Theme.white))
-        let ts = tip.size()
-        var box = NSRect(x: p.x + 8, y: r.minY, width: ts.width + 12, height: ts.height + 6)
-        if box.maxX > bounds.width - 4 { box.origin.x = p.x - 8 - box.width }
-        let bubble = NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4)
-        NSColor(srgbRed: 0.10, green: 0.12, blue: 0.15, alpha: 0.95).setFill()
+    private func xFor(_ t: Date, in r: NSRect) -> CGFloat {
+        let from = Date().addingTimeInterval(-range.seconds)
+        let f = max(0, min(1, t.timeIntervalSince(from) / range.seconds))
+        return r.minX + r.width * CGFloat(f)
+    }
+
+    private func drawTimeline(top: CGFloat) {
+        let left = pad.width, right = bounds.width - pad.width
+        text("Agents", Theme.text, Theme.font).draw(at: NSPoint(x: left, y: top + 2))
+
+        // Legend: the models present, right-aligned.
+        let families = Array(Set(snap.spans.map(\.family))).sorted()
+        var items: [(NSAttributedString, NSColor)] = families.map { (text($0, Theme.dim), Theme.model($0)) }
+        items.reverse()
+        var x = right
+        for (label, color) in items {
+            x -= label.size().width
+            label.draw(at: NSPoint(x: x, y: top + 3))
+            x -= 10
+            color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: x, y: top + 7, width: 7, height: 7)).fill()
+            x -= 12
+        }
+
+        let r = NSRect(x: chartRect.minX, y: top + headerH, width: chartRect.width, height: 0)
+        for (span, lane) in lanes() {
+            let x0 = xFor(span.start, in: r)
+            let x1 = max(x0 + 3, xFor(span.end, in: r))
+            let bar = NSRect(x: x0, y: r.minY + CGFloat(lane) * (laneH + laneGap), width: x1 - x0, height: laneH)
+            let color = Theme.model(span.family)
+            let alpha: CGFloat = span.running && !Theme.reduceMotion ? (spinPhase ? 1 : 0.7) : 0.9
+            color.withAlphaComponent(alpha * fade(span.id)).setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 3, yRadius: 3).fill()
+            spanRegions.append((bar.insetBy(dx: -2, dy: -2), span))
+        }
+    }
+
+    private func drawHeatmap(top: CGFloat) {
+        let labelW: CGFloat = 30
+        let x0 = pad.width + labelW
+        let width = bounds.width - pad.width - x0
+        let cellW = (width - 23 * cellGap) / 24
+        let maxValue = max(1, snap.heat.flatMap { $0 }.max() ?? 1)
+        for (d, day) in snap.heat.enumerated() {
+            let y = top + CGFloat(d) * (cellH + cellGap)
+            if d < snap.heatDays.count {
+                let isToday = d == snap.heat.count - 1
+                text(isToday ? "Today" : dayName.string(from: snap.heatDays[d]), isToday ? Theme.text : Theme.dim)
+                    .draw(at: NSPoint(x: pad.width, y: y - 1))
+            }
+            for (h, v) in day.enumerated() {
+                let cell = NSRect(x: x0 + CGFloat(h) * (cellW + cellGap), y: y, width: cellW, height: cellH)
+                let color = v == 0 ? Theme.dim.withAlphaComponent(0.14)
+                                   : Theme.fg.withAlphaComponent(0.22 + 0.78 * CGFloat(Double(v) / Double(maxValue)))
+                color.setFill()
+                NSBezierPath(roundedRect: cell, xRadius: 2, yRadius: 2).fill()
+                heatRegions.append((cell.insetBy(dx: -cellGap / 2, dy: -cellGap / 2), d, h))
+            }
+        }
+        let axisY = top + 7 * (cellH + cellGap) + 1
+        for h in [0, 6, 12, 18] {
+            text("\(h):00", Theme.dim).draw(at: NSPoint(x: x0 + CGFloat(h) * (cellW + cellGap), y: axisY))
+        }
+    }
+
+    // MARK: Hover
+
+    private func chartIndex() -> Int? {
+        guard let m = mouse, range != .week, snap.main.count > 1,
+              chartRect.insetBy(dx: -6, dy: -8).contains(m) else { return nil }
+        let n = snap.main.count
+        return max(0, min(n - 1, Int(((m.x - chartRect.minX) / chartRect.width * CGFloat(n - 1)).rounded())))
+    }
+
+    private func tooltipLines() -> [String]? {
+        guard let m = mouse else { return nil }
+        if let i = chartIndex() {
+            let end = Date().addingTimeInterval(-Double(snap.main.count - 1 - i) * snap.bucketSeconds)
+            let start = end.addingTimeInterval(-snap.bucketSeconds)
+            var lines = [snap.bucketSeconds <= 60 ? hm.string(from: end) : "\(hm.string(from: start))–\(hm.string(from: end))",
+                         "Main session: \(tokens(Int(snap.main[i])))/min"]
+            if hasAgentSeries { lines.append("Agents: \(tokens(Int(snap.agentSeries[i])))/min") }
+            return lines
+        }
+        if let (_, span) = spanRegions.last(where: { $0.0.contains(m) }) {
+            return [span.type, span.task.isEmpty ? "(no description)" : span.task,
+                    "Model: \(span.family) · \(exact(span.tokens)) tokens",
+                    span.running ? "Running for \(duration(Date().timeIntervalSince(span.start)))"
+                                 : "\(hm.string(from: span.start))–\(hm.string(from: span.end)) (\(duration(span.end.timeIntervalSince(span.start))))"]
+        }
+        if let (_, d, h) = heatRegions.first(where: { $0.0.contains(m) }), d < snap.heatDays.count {
+            return ["\(dayLong.string(from: snap.heatDays[d])), \(String(format: "%02d", h)):00–\(String(format: "%02d", (h + 1) % 24)):00",
+                    "\(exact(snap.heat[d][h])) tokens"]
+        }
+        if let (_, tip) = rowRegions.first(where: { $0.0.contains(m) }) { return tip }
+        return nil
+    }
+
+    private func drawTooltip() {
+        guard let m = mouse, let lines = tooltipLines(), !lines.isEmpty else { return }
+        let body = NSMutableAttributedString()
+        for (i, l) in lines.enumerated() {
+            if i > 0 { body.append(text("\n", Theme.text)) }
+            body.append(text(l, i == 0 ? Theme.text : Theme.dim, i == 0 ? Theme.smallBold : Theme.small))
+        }
+        let size = body.size()
+        var box = NSRect(x: m.x + 12, y: m.y + 14, width: size.width + 14, height: size.height + 8)
+        if box.maxX > bounds.width - 4 { box.origin.x = max(4, m.x - 12 - box.width) }
+        if box.maxY > bounds.height - 4 { box.origin.y = max(titleHeight + 2, m.y - 10 - box.height) }
+        let bubble = NSBezierPath(roundedRect: box, xRadius: 5, yRadius: 5)
+        Theme.p.tooltipBg.setFill()
         bubble.fill()
-        Theme.border.withAlphaComponent(0.5).setStroke()
+        Theme.border.withAlphaComponent(0.6).setStroke()
         bubble.lineWidth = 1
         bubble.stroke()
-        tip.draw(at: NSPoint(x: box.minX + 6, y: box.minY + 3))
+        body.draw(at: NSPoint(x: box.minX + 7, y: box.minY + 4))
     }
 
     override func updateTrackingAreas() {
@@ -457,49 +950,25 @@ final class MonitorView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        let n = snap.rate.count
-        var i: Int?
-        if n > 1, chartRect.insetBy(dx: -6, dy: -8).contains(p) {
-            i = max(0, min(n - 1, Int(((p.x - chartRect.minX) / chartRect.width * CGFloat(n - 1)).rounded())))
-        }
-        if i != hoverIndex { hoverIndex = i; needsDisplay = true }
+        mouse = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
-        if hoverIndex != nil { hoverIndex = nil; needsDisplay = true }
+        mouse = nil
+        needsDisplay = true
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 9, yRadius: 9)
-        Theme.bg.setFill()
-        shape.fill()
-
-        NSGraphicsContext.saveGraphicsState()
-        shape.addClip()
-        NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 0.07).setFill()
-        NSRect(x: 0, y: 0, width: bounds.width, height: titleHeight).fill()
-        NSGraphicsContext.restoreGraphicsState()
-
-        Theme.border.setStroke()
-        shape.lineWidth = 1
-        shape.stroke()
-        Theme.border.withAlphaComponent(0.3).setFill()
-        NSRect(x: 0, y: titleHeight, width: bounds.width, height: 1).fill()
-
-        let title = Line().add("● ", Theme.hot).add("● ", Theme.warn).add("●", Theme.fg).add("   claudemon", Theme.dim).s
-        title.draw(at: NSPoint(x: 10, y: (titleHeight - title.size().height) / 2))
-        let clk = NSAttributedString(string: clock.string(from: Date()), attributes: [.font: Theme.font, .foregroundColor: Theme.dim])
-        clk.draw(at: NSPoint(x: bounds.width - clk.size().width - 12, y: (titleHeight - clk.size().height) / 2))
-
-        let b = body()
-        b.draw(at: NSPoint(x: pad.width, y: titleHeight + pad.height))
-        drawChart(top: titleHeight + pad.height + ceil(b.size().height) + chartGap)
-    }
+    // MARK: Input
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if p.y < titleHeight && event.clickCount == 2 { onToggleCompact?(); return }
         if p.y < titleHeight && p.x < 22 { NSApp.terminate(nil); return }
+        if !compact, let (_, r) = segmentRects.first(where: { $0.0.contains(p) }) {
+            if r != range { onRangeChange?(r) }
+            return
+        }
         window?.performDrag(with: event)
     }
 
@@ -508,6 +977,20 @@ final class MonitorView: NSView {
         let pin = NSMenuItem(title: "Always on Top", action: #selector(AppDelegate.togglePin), keyEquivalent: "")
         pin.state = window?.level == .floating ? .on : .off
         menu.addItem(pin)
+        let small = NSMenuItem(title: "Compact Mode", action: #selector(AppDelegate.toggleCompact), keyEquivalent: "c")
+        small.keyEquivalentModifierMask = []
+        small.state = compact ? .on : .off
+        menu.addItem(small)
+        let themes = NSMenu()
+        for t in ThemeChoice.allCases {
+            let item = NSMenuItem(title: t.title, action: #selector(AppDelegate.chooseTheme(_:)), keyEquivalent: "")
+            item.tag = t.rawValue
+            item.state = Theme.choice == t ? .on : .off
+            themes.addItem(item)
+        }
+        let themeItem = NSMenuItem(title: "Theme", action: nil, keyEquivalent: "")
+        themeItem.submenu = themes
+        menu.addItem(themeItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit claudemon", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -516,7 +999,10 @@ final class MonitorView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func keyDown(with event: NSEvent) {
-        if event.charactersIgnoringModifiers == "q" || event.keyCode == 53 { NSApp.terminate(nil) }
+        let key = event.charactersIgnoringModifiers ?? ""
+        if key == "q" || event.keyCode == 53 { NSApp.terminate(nil) }
+        else if key == "c" { onToggleCompact?() }
+        else if let n = Int(key), let r = TimeRange(rawValue: n - 1), r != range { onRangeChange?(r) }
     }
 }
 
@@ -531,10 +1017,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let view = MonitorView()
     let store = Store()
     let queue = DispatchQueue(label: "claudemon.store")
+    let defaults = UserDefaults.standard
     var ticks = 0
+    var animationTimer: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        queue.sync { store.refresh(); view.snap = store.snapshot() }
+        Theme.choice = ThemeChoice(rawValue: defaults.integer(forKey: "theme")) ?? .terminal
+        view.range = TimeRange(rawValue: defaults.integer(forKey: "range")) ?? .hour
+        view.compact = defaults.bool(forKey: "compact")
+        view.onRangeChange = { [weak self] r in self?.setRange(r) }
+        view.onToggleCompact = { [weak self] in self?.toggleCompact() }
+
         let size = view.fittingSize()
         window = PanelWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isOpaque = false
@@ -550,30 +1043,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keepOnScreen()
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
+
+        refresh()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+    }
+
+    func refresh() {
+        let range = view.range
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.store.refresh()
+            let snap = self.store.snapshot(range: range)
+            DispatchQueue.main.async {
+                guard snap.range == self.view.range else { return } // the range changed while this was computing
+                self.view.apply(snap)
+                self.resize()
+                self.view.needsDisplay = true
+                self.animateIfNeeded()
+            }
+        }
     }
 
     func tick() {
         ticks += 1
         view.spinPhase.toggle()
-        if ticks % 2 == 0 {
-            queue.async { [weak self] in
-                guard let self else { return }
-                self.store.refresh()
-                let snap = self.store.snapshot()
-                DispatchQueue.main.async { self.view.snap = snap; self.resize() }
-            }
-        }
+        if ticks % 2 == 0 { refresh() }
         view.needsDisplay = true
     }
 
-    func resize() {
+    func animateIfNeeded() {
+        guard animationTimer == nil, view.needsAnimation else { return }
+        animationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let moving = self.view.stepAnimation()
+            self.view.needsDisplay = true
+            if !moving { timer.invalidate(); self.animationTimer = nil }
+        }
+    }
+
+    func setRange(_ r: TimeRange) {
+        view.range = r
+        defaults.set(r.rawValue, forKey: "range")
+        view.needsDisplay = true
+        refresh()
+    }
+
+    @objc func toggleCompact() {
+        view.compact.toggle()
+        defaults.set(view.compact, forKey: "compact")
+        resize(force: true)
+        view.needsDisplay = true
+    }
+
+    @objc func chooseTheme(_ sender: NSMenuItem) {
+        Theme.choice = ThemeChoice(rawValue: sender.tag) ?? .terminal
+        defaults.set(Theme.choice.rawValue, forKey: "theme")
+        view.needsDisplay = true
+    }
+
+    @objc func togglePin() {
+        window.level = window.level == .floating ? .normal : .floating
+    }
+
+    /// Fits the window to its content, keeping the right edge and the title bar where they are.
+    /// Normal updates only ever widen the window, so it doesn't jitter as numbers change.
+    func resize(force: Bool = false) {
         let size = view.fittingSize()
-        guard abs(size.height - window.frame.height) > 1 || size.width > window.frame.width else { return }
         var f = window.frame
-        let width = max(size.width, f.width)
-        f.origin.x -= width - f.width          // grow leftwards: it sits at the right edge of the screen
-        f.origin.y += f.height - size.height   // and keep the title bar where it was
+        let width = force ? size.width : max(size.width, f.width)
+        guard force || abs(size.height - f.height) > 1 || width != f.width else { return }
+        f.origin.x -= width - f.width
+        f.origin.y += f.height - size.height
         f.size = NSSize(width: width, height: size.height)
         window.setFrame(f, display: false)
         keepOnScreen()
@@ -585,10 +1125,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         f.origin.x = min(max(f.origin.x, screen.minX), screen.maxX - f.width)
         f.origin.y = min(max(f.origin.y, screen.minY), screen.maxY - f.height)
         if f != window.frame { window.setFrame(f, display: false) }
-    }
-
-    @objc func togglePin() {
-        window.level = window.level == .floating ? .normal : .floating
     }
 }
 
