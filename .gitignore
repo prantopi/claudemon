@@ -1,0 +1,3 @@
+# Built app (run ./build.sh to create it)
+Claudemon.app/
+.DS_Store
