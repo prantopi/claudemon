@@ -67,6 +67,30 @@ Claude Code saves every conversation on your Mac in `~/.claude/projects/`, inclu
 - **Cache reads dominate the totals.** That's normal: Claude re-reads your conversation's context on every reply. The `out` figure is what Claude actually wrote.
 - **macOS only.** It's a native Swift app.
 
+## Windows and Linux
+
+A Python port lives in `windows-linux/`. It needs Python 3.9 or later with Tk. On Linux, install your distribution's `python3-tk` package.
+
+```bash
+pip install -r windows-linux/requirements.txt  # optional, Windows only
+python3 windows-linux/claudemon.py
+```
+
+On Windows you can also double-click `windows-linux/claudemon.bat`, which starts it with `pythonw` so no console window opens.
+
+The optional requirement is psutil, which Claudemon uses on Windows to check whether a session is still running. Without it, Claudemon uses a built-in check instead.
+
+It shows the same rows, chart and controls as the Mac app, with these differences. The port also runs on macOS (with a Python whose Tk works, such as the python.org installer), which is handy for testing; the last column is for that case.
+
+| | Windows | Linux | macOS (Python port) |
+|---|---|---|---|
+| Window corners | Rounded, without anti-aliasing | Rounded, without anti-aliasing (X Shape extension; square if it isn't available, for example on Wayland without XWayland) | Rounded, anti-aliased |
+| Shadow and blur | None | None | None |
+| Match System theme | Follows the Windows app theme | Reads GNOME settings; defaults to dark elsewhere | Defaults to dark |
+| Reduce Motion | Right-click menu option | Right-click menu option | Right-click (or Control-click) menu option |
+| Keyboard shortcuts | Work while the window has focus | Work after clicking the window | Work after clicking the window |
+| Settings file | `%APPDATA%\claudemon\settings.json` | `$XDG_CONFIG_HOME/claudemon/settings.json` (default `~/.config/claudemon/settings.json`) | Same as Linux |
+
 ## Part of Claude Code Dev Team
 
 Claudemon is also included in [claude-code-dev-team](https://github.com/prantopi/claude-code-dev-team), a set of 9 subagents that work in parallel. Claudemon shows each agent live as it runs.

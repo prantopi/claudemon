@@ -1,0 +1,5 @@
+# Optional. claudemon runs without any third-party dependencies: liveness.py falls back to a
+# ctypes-based process check on Windows and os.kill(pid, 0) on Linux (architecture.md D7).
+# Installing psutil lets Windows liveness checks use psutil.pid_exists() instead, which is not
+# required but is a little more robust across unusual process states. Not used on Linux.
+psutil>=5.9; sys_platform == "win32"

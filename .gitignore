@@ -1,3 +1,12 @@
 # Built app (run ./build.sh to create it)
 Claudemon.app/
 .DS_Store
+.claude/worktrees/
+.claude/settings.local.json
+__pycache__/
+
+# Local dev-team workspace (not published)
+claude/
+.claude/
+CLAUDE.md
+future fix.md
