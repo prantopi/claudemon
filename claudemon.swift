@@ -30,6 +30,10 @@ final class Transcript {
     var lastStop: String?
     var lastContext = 0
     var lastReply: Date?
+    var session = ""           // main: its own id; subagent: the main session it belongs to
+    var action: String?        // what it is doing now (see noteAssistant)
+    var actionTime: Date?
+    var actionIsTool = false
     // subagents only
     let isAgent: Bool
     var agentType = "agent"
@@ -57,6 +61,28 @@ struct Span {
     let end: Date
     let tokens: Int
     let running: Bool
+    let session: String
+    let action: String?
+}
+
+/// A live Claude Code session and the subagents it is running right now.
+struct NowSession {
+    let project, name, cwd, status: String
+    let busy: Bool
+    let action: String?
+    let since: Date?
+    let agents: [Span]
+}
+
+/// Official usage limits, as written by the status-line bridge.
+struct LimitWindow {
+    let percent: Double
+    let resets: Date
+}
+
+struct Limits {
+    let updated: Date
+    let fiveHour, week: LimitWindow?
 }
 
 struct Snapshot {
@@ -77,6 +103,8 @@ struct Snapshot {
     var models: [(name: String, tokens: Int, replies: Int)] = []
     var agentsToday: [Span] = []                       // running first, then newest
     var projects: [(name: String, tokens: Int)] = []
+    var now: [NowSession] = []                         // live sessions: busy first, then latest action
+    var limits: Limits?
 }
 
 final class Store {
@@ -119,6 +147,9 @@ final class Store {
                   m >= cutoff else { continue }
             let isAgent = url.deletingLastPathComponent().lastPathComponent == "subagents"
             let t = Transcript(isAgent: isAgent)
+            // <project-dir>/<sessionId>.jsonl, or <project-dir>/<sessionId>/subagents/agent-*.jsonl
+            t.session = isAgent ? url.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
+                                : url.deletingPathExtension().lastPathComponent
             if isAgent,
                let data = try? Data(contentsOf: url.deletingPathExtension().appendingPathExtension("meta.json")),
                let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -144,6 +175,15 @@ final class Store {
         for line in data.split(separator: 0x0A) {
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
             if t.project == "?", let cwd = obj["cwd"] as? String { t.project = Store.projectName(cwd) } // where the session started
+            let type = obj["type"] as? String
+            let lineTime = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) }
+            if type == "assistant", let msg = obj["message"] as? [String: Any] {
+                noteAssistant(msg, t, lineTime)
+            } else if type == "user", !t.actionIsTool {
+                // A prompt or tool results: the model is working on it. A running tool keeps its action.
+                t.action = "Thinking…"
+                t.actionTime = lineTime
+            }
             guard obj["type"] as? String == "assistant",
                   let msg = obj["message"] as? [String: Any],
                   let u = msg["usage"] as? [String: Any],
@@ -162,6 +202,57 @@ final class Store {
         }
     }
 
+    /// Updates a transcript's current action from one assistant line.
+    private func noteAssistant(_ msg: [String: Any], _ t: Transcript, _ time: Date?) {
+        let content = msg["content"] as? [[String: Any]] ?? []
+        if let use = content.last(where: { $0["type"] as? String == "tool_use" }) {
+            t.action = Store.toolAction(use["name"] as? String ?? "", use["input"] as? [String: Any] ?? [:])
+            t.actionTime = time
+            t.actionIsTool = true
+        } else if !content.isEmpty, content.allSatisfy({ $0["type"] as? String == "text" }),
+                  msg["stop_reason"] as? String == "end_turn" {
+            t.action = t.isAgent ? "Finished" : "Waiting for you"
+            t.actionTime = time
+            t.actionIsTool = false
+        }
+    }
+
+    /// Describes a tool call in a few words. Every value taken from the transcript is untrusted and clipped.
+    static func toolAction(_ name: String, _ input: [String: Any]) -> String {
+        func value(_ s: String?) -> String? {
+            let clean = sanitize(s ?? "", 40)
+            return clean.isEmpty ? nil : clean
+        }
+        func field(_ key: String) -> String? { value(input[key] as? String) }
+        func file(_ key: String) -> String? { value((input[key] as? String).map { ($0 as NSString).lastPathComponent }) }
+        let found: String?
+        switch name {
+        case "Edit", "MultiEdit": found = file("file_path").map { "Editing \($0)" }
+        case "NotebookEdit": found = file("notebook_path").map { "Editing \($0)" }
+        case "Write": found = file("file_path").map { "Writing \($0)" }
+        case "Read": found = file("file_path").map { "Reading \($0)" }
+        case "Bash":
+            let firstLine = (input["command"] as? String)?.split(whereSeparator: \.isNewline).first.map(String.init)
+            found = (field("description") ?? value(firstLine)).map { "Running \($0)" }
+        case "Grep": found = field("pattern").map { "Searching for \($0)" }
+        case "Glob": found = field("pattern").map { "Finding \($0)" }
+        case "Agent", "Task": found = (field("description") ?? field("subagent_type")).map { "Starting agent: \($0)" }
+        case "WebFetch": found = value((input["url"] as? String).flatMap { URL(string: $0)?.host }).map { "Reading \($0)" }
+        case "WebSearch": found = field("query").map { "Searching the web: \($0)" }
+        case "TodoWrite": found = "Updating the plan"
+        case "Skill": found = field("skill").map { "Using skill \($0)" }
+        default:
+            // mcp__<server>__<tool>
+            let parts = name.hasPrefix("mcp__") ? name.dropFirst(5).components(separatedBy: "__") : []
+            if parts.count >= 2, let server = value(parts[0]), let tool = value(parts.dropFirst().joined(separator: "__")) {
+                found = "Using \(server): \(tool)"
+            } else {
+                found = nil
+            }
+        }
+        return found ?? "Using \(value(name) ?? "a tool")"
+    }
+
     /// A project's folder name. Agents in git worktrees run inside `<project>/.claude/worktrees/<name>`,
     /// so those count toward the project they belong to.
     static func projectName(_ cwd: String) -> String {
@@ -169,10 +260,42 @@ final class Store {
         return (root as NSString).lastPathComponent
     }
 
-    private func liveSessionCount() -> Int {
+    /// Sessions whose process is alive, with what `~/.claude/sessions/<pid>.json` says about them.
+    private func liveSessions() -> [[String: Any]] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: sessionsDir.path)) ?? []
-        return names.filter { $0.hasSuffix(".json") }.compactMap { pid_t($0.dropLast(5)) }
-            .filter { kill($0, 0) == 0 || errno == EPERM }.count
+        return names.filter { $0.hasSuffix(".json") }.compactMap { name -> [String: Any]? in
+            guard let pid = pid_t(name.dropLast(5)), kill(pid, 0) == 0 || errno == EPERM else { return nil }
+            let data = try? Data(contentsOf: sessionsDir.appendingPathComponent(name))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        }
+    }
+
+    /// `~/.claude/claudemon/limits.json`, written by the status-line bridge. Nil when absent, invalid or expired.
+    private func readLimits(now: Date) -> Limits? {
+        let path = home.appendingPathComponent(".claude/claudemon/limits.json").path
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        guard let data = try? fh.read(upToCount: 65537), data.count <= 65536,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Store.number(obj["version"]) == 1,
+              let updated = Store.number(obj["updated_at"]) else { return nil }
+        var windows: [LimitWindow?] = []
+        for key in ["five_hour", "seven_day"] {
+            guard let raw = obj[key] else { windows.append(nil); continue }
+            guard let w = raw as? [String: Any],
+                  let pct = Store.number(w["used_percentage"]), (0...100).contains(pct),
+                  let resets = Store.number(w["resets_at"]), resets > 0 else { return nil }
+            let window = LimitWindow(percent: pct, resets: Date(timeIntervalSince1970: resets))
+            windows.append(window.resets > now ? window : nil)  // a window counts only until it resets
+        }
+        guard windows.contains(where: { $0 != nil }) else { return nil }
+        return Limits(updated: Date(timeIntervalSince1970: updated), fiveHour: windows[0], week: windows[1])
+    }
+
+    /// A finite JSON number (not a boolean).
+    static func number(_ v: Any?) -> Double? {
+        guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite else { return nil }
+        return n.doubleValue
     }
 
     func snapshot(range: TimeRange) -> Snapshot {
@@ -181,7 +304,9 @@ final class Store {
         var s = Snapshot()
         s.loaded = true
         s.range = range
-        s.liveSessions = liveSessionCount()
+        let live = liveSessions()
+        s.liveSessions = live.count
+        s.limits = readLimits(now: now)
 
         let mains = transcripts.filter { !$0.value.isAgent }
         s.busySessions = min(s.liveSessions, mains.values.filter { now.timeIntervalSince($0.mtime) < 20 }.count)
@@ -273,7 +398,8 @@ final class Store {
             guard t.isAgent, let f = perFile[path] else { return nil }
             let running = now.timeIntervalSince(t.mtime) < 90 && t.lastStop != "end_turn"
             return Span(id: path, type: t.agentType, task: t.agentTask, family: family(f.model),
-                        start: f.first, end: running ? now : f.last, tokens: f.tokens, running: running)
+                        start: f.first, end: running ? now : f.last, tokens: f.tokens, running: running,
+                        session: t.session, action: t.action)
         }
         s.agentsToday = spans.filter { $0.end >= startOfDay }
             .sorted { ($0.running ? 1 : 0, $0.start) > ($1.running ? 1 : 0, $1.start) }
@@ -281,6 +407,21 @@ final class Store {
             let from = now.addingTimeInterval(-range.seconds)
             s.spans = spans.filter { $0.end >= from }.sorted { $0.start < $1.start }
         }
+
+        // Now: each live session, what it is doing, and the agents it is running.
+        var mainById: [String: Transcript] = [:]
+        for t in mains.values where mainById[t.session].map({ $0.mtime < t.mtime }) ?? true { mainById[t.session] = t }
+        s.now = live.map { info in
+            let id = info["sessionId"] as? String ?? ""
+            let t = id.isEmpty ? nil : mainById[id]
+            let status = info["status"] as? String
+            let cwd = info["cwd"] as? String ?? ""
+            let busy = status.map { $0 == "busy" } ?? t.map { now.timeIntervalSince($0.mtime) < 20 } ?? false
+            return NowSession(project: cwd.isEmpty ? t?.project ?? "?" : Store.projectName(cwd),
+                              name: info["name"] as? String ?? "", cwd: cwd, status: status ?? "", busy: busy,
+                              action: t?.action, since: t?.actionTime,
+                              agents: spans.filter { $0.running && !id.isEmpty && $0.session == id }.sorted { $0.start < $1.start })
+        }.sorted { ($0.busy ? 1 : 0, $0.since ?? .distantPast) > ($1.busy ? 1 : 0, $1.since ?? .distantPast) }
         return s
     }
 
@@ -403,6 +544,20 @@ func clip(_ s: String, _ n: Int) -> String {
     s.count <= n ? s.padding(toLength: n, withPad: " ", startingAt: 0) : String(s.prefix(n - 1)) + "…"
 }
 
+/// Untrusted text for one line: control characters become spaces, runs of spaces collapse, clipped to n with "…".
+func sanitize(_ s: String, _ n: Int) -> String {
+    var out = ""
+    for ch in s {
+        if ch == " " || ch.isNewline || ch.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) {
+            if !out.isEmpty && out.last != " " { out.append(" ") }
+        } else {
+            out.append(ch)
+        }
+    }
+    if out.last == " " { out.removeLast() }
+    return out.count <= n ? out : String(out.prefix(n - 1)) + "…"
+}
+
 func duration(_ seconds: TimeInterval) -> String {
     let s = Int(max(0, seconds))
     return s >= 3600 ? "\(s / 3600)h\(s % 3600 / 60)m" : s >= 60 ? "\(s / 60)m\(s % 60)s" : "\(s)s"
@@ -441,6 +596,8 @@ final class MonitorView: NSView {
     let hm: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
     let dayName: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE"; return f }()
     let dayLong: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d MMM"; return f }()
+    let dayHM: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE HH:mm"; return f }()
+    let fullTime: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d MMM HH:mm:ss"; return f }()
 
     let pad = NSSize(width: 14, height: 10)
     let titleHeight: CGFloat = 24
@@ -520,6 +677,7 @@ final class MonitorView: NSView {
                  "\(s.liveSessions) running now, \(s.busySessions) active in the last 20s",
                  s.context > 0 ? "Latest conversation: \(exact(s.context)) tokens of context (\(s.contextProject))" : "No conversation yet"])
         lines.append(ses)
+        lines += nowRows()
 
         let usageTip = ["Tokens today (\(exact(s.todayReplies)) replies)",
                         "Input:        \(exact(s.today.input))",
@@ -535,6 +693,7 @@ final class MonitorView: NSView {
         lines.append(Line().add("          ").add("in ", Theme.dim).add(tokens(s.today.input + s.today.cacheWrite))
             .add("  out ", Theme.dim).add(tokens(s.today.output))
             .add("  cache ", Theme.dim).add(tokens(s.today.cacheRead)).tip(usageTip))
+        if let limits = s.limits { lines.append(limitsRow(limits)) }
 
         let speed = num("speed", s.perMinute)
         lines.append(Line().label("Speed").add(tokens(speed), speed > 0 ? Theme.fg : Theme.dim, bold: true)
@@ -572,10 +731,7 @@ final class MonitorView: NSView {
                 .add(" " + clip(a.task, 22), Theme.dim)
                 .add(" " + tokens(a.tokens).padding(toLength: 6, withPad: " ", startingAt: 0), a.running ? Theme.text : Theme.dim)
                 .add(a.running ? duration(Date().timeIntervalSince(a.start)) : "", Theme.warn)
-            lines.append(row.tip([a.type, a.task.isEmpty ? "(no description)" : a.task,
-                                  "Model: \(a.family) · \(exact(a.tokens)) tokens",
-                                  a.running ? "Running for \(duration(Date().timeIntervalSince(a.start)))"
-                                            : "Ran \(hm.string(from: a.start))–\(hm.string(from: a.end)) (\(duration(a.end.timeIntervalSince(a.start))))"]))
+            lines.append(row.tip(agentTip(a)))
         }
 
         if !s.projects.isEmpty {
@@ -587,6 +743,63 @@ final class MonitorView: NSView {
             lines.append(top.tip(["Projects today"] + s.projects.prefix(6).map { "\($0.name): \(exact($0.tokens)) tokens" }))
         }
         return lines
+    }
+
+    private func agentTip(_ a: Span) -> [String] {
+        [a.type, a.task.isEmpty ? "(no description)" : a.task,
+         "Model: \(a.family) · \(exact(a.tokens)) tokens",
+         a.running ? "Running for \(duration(Date().timeIntervalSince(a.start)))"
+                   : "Ran \(hm.string(from: a.start))–\(hm.string(from: a.end)) (\(duration(a.end.timeIntervalSince(a.start))))"]
+    }
+
+    /// One line per live session (at most 3), each followed by its running agents (at most 3).
+    private func nowRows() -> [Line] {
+        let now = Date()
+        var lines: [Line] = []
+        for n in snap.now.prefix(3) {
+            let row = Line().add("  ").add("● ", n.busy ? Theme.warn : Theme.dim)
+                .add(clip(n.project, 16).trimmingCharacters(in: .whitespaces), Theme.fg)
+            if let action = n.action {
+                row.add(" · ", Theme.dim).add(sanitize(action, 56))
+            }
+            if let since = n.since { row.add(" · ", Theme.dim).add(duration(now.timeIntervalSince(since)), Theme.dim) }
+            var tip = [n.project]
+            if !n.name.isEmpty { tip.append("Session: \(n.name)") }
+            if !n.cwd.isEmpty { tip.append(n.cwd) }
+            tip.append("Status: \(n.status.isEmpty ? (n.busy ? "busy" : "idle") : n.status)")
+            if let action = n.action { tip.append(action) }
+            if let since = n.since { tip.append("since \(clock.string(from: since))") }
+            lines.append(row.tip(tip))
+
+            for (i, a) in n.agents.prefix(3).enumerated() {
+                let last = i == n.agents.count - 1
+                let agent = Line(alpha: fade(a.id)).add(last ? "    └─ " : "    ├─ ", Theme.dim)
+                    .add(spinPhase ? "◐ " : "◓ ", Theme.warn)
+                    .add(sanitize(a.type, 20), Theme.text)
+                if let action = a.action { agent.add(": ", Theme.dim).add(sanitize(action, 56)) }
+                agent.add(" · ", Theme.dim).add(duration(now.timeIntervalSince(a.start)), Theme.warn)
+                lines.append(agent.tip(agentTip(a) + (a.action.map { ["Now: \($0)"] } ?? [])))
+            }
+            if n.agents.count > 3 { lines.append(Line().add("    └─ +\(n.agents.count - 3) more", Theme.dim)) }
+        }
+        if snap.now.count > 3 { lines.append(Line().add("  +\(snap.now.count - 3) more sessions", Theme.dim)) }
+        return lines
+    }
+
+    private func limitsRow(_ l: Limits) -> Line {
+        let row = Line().label("Limits")
+        var tip = ["Official Claude usage from Claude Code's status line",
+                   "Updated \(Int(max(0, Date().timeIntervalSince(l.updated))))s ago"]
+        let windows = [("5h", "5-hour", l.fiveHour, hm), ("week", "7-day", l.week, dayHM)]
+        for (short, long, window, format) in windows {
+            guard let w = window else { continue }
+            let pct = Int((w.percent + 0.5).rounded(.down))   // half-up
+            if row.s.length > 10 { row.add(" · ", Theme.dim) }
+            row.add("\(short) ", Theme.dim).add("\(pct)%", pct >= 90 ? Theme.hot : pct >= 70 ? Theme.warn : Theme.fg, bold: true)
+                .add(" · resets \(format.string(from: w.resets))", Theme.dim)
+            tip.append("\(long): \(String(format: "%g", w.percent))% used, resets \(fullTime.string(from: w.resets))")
+        }
+        return row.tip(tip)
     }
 
     func compactSummary() -> NSAttributedString {
