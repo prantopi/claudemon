@@ -54,7 +54,6 @@ class Transcript:
     session_id: str = ""  # main: the file stem; subagent: the <sessionId> folder above subagents/
     action: Optional[str] = None  # latest current action (activity spec §1), already sanitised
     action_time: Optional[float] = None
-    action_from_tool: bool = False
 
 
 class TimeRange(IntEnum):

@@ -33,7 +33,6 @@ final class Transcript {
     var session = ""           // main: its own id; subagent: the main session it belongs to
     var action: String?        // what it is doing now (see noteAction)
     var actionTime: Date?
-    var actionIsTool = false
     // subagents only
     let isAgent: Bool
     var agentType = "agent"
@@ -199,30 +198,32 @@ final class Store {
     private func noteAction(_ obj: [String: Any], _ t: Transcript, _ time: Date?) {
         let type = obj["type"] as? String
         guard type == "assistant" || type == "user", obj["isMeta"] as? Bool != true,
+              obj["isCompactSummary"] as? Bool != true,
               let msg = obj["message"] as? [String: Any] else { return }
         if let text = msg["content"] as? String, text.hasPrefix("<local-command") || text.hasPrefix("<command-") {
             return  // slash-command noise and compact summaries
         }
-        let content = msg["content"] as? [[String: Any]] ?? []
-        func set(_ action: String, tool: Bool = false) {
+        func set(_ action: String) {
             t.action = action
             t.actionTime = time
-            t.actionIsTool = tool
         }
         let done = t.isAgent ? "Finished" : "Waiting for you"
         if type == "assistant" {
+            // non-object items are skipped; the rest still counts
+            let content = (msg["content"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
             let blocks = content.filter { $0["type"] as? String != "thinking" }
             if let use = content.last(where: { $0["type"] as? String == "tool_use" }) {
-                set(Store.toolAction(use["name"] as? String ?? "", use["input"] as? [String: Any] ?? [:]), tool: true)
+                set(Store.toolAction(use["name"] as? String ?? "", use["input"] as? [String: Any] ?? [:]))
             } else if !blocks.isEmpty, blocks.allSatisfy({ $0["type"] as? String == "text" }),
-                      msg["stop_reason"] as? String == "end_turn" {
-                set(done)
+                      msg["stop_reason"] as? String == "end_turn" || msg["model"] as? String == "<synthetic>" {
+                set(done)  // a synthetic reply (session limit, API error) also ends the turn
             } else {
                 set("Thinking…")
             }
             return
         }
         // user line: an interruption, tool results, or a prompt
+        let content = msg["content"] as? [[String: Any]] ?? []
         if Store.userText(msg["content"]).contains("[Request interrupted by user") {
             set(done)
         } else if !content.isEmpty, content.allSatisfy({ $0["type"] as? String == "tool_result" }) {
@@ -444,8 +445,10 @@ final class Store {
             let status = (info["status"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             let cwd = info["cwd"] as? String ?? ""
             let busy = status.map { $0 == "busy" } ?? t.map { now.timeIntervalSince($0.mtime) < 20 } ?? false
-            return NowSession(project: cwd.isEmpty ? t?.project ?? "?" : Store.projectName(cwd),
-                              name: info["name"] as? String ?? "", cwd: cwd, status: status ?? "", busy: busy,
+            let project = sanitize(cwd.isEmpty ? t?.project ?? "?" : Store.projectName(cwd), 200)
+            return NowSession(project: project.isEmpty ? "?" : project,
+                              name: sanitize(info["name"] as? String ?? "", 200), cwd: sanitize(cwd, 200),
+                              status: sanitize(status ?? "", 200), busy: busy,
                               action: t?.action, since: t?.actionTime,
                               agents: spans.filter { $0.running && !id.isEmpty && $0.session == id }.sorted { $0.start > $1.start })
         }.sorted { ($0.busy ? 1 : 0, $0.since ?? .distantPast) > ($1.busy ? 1 : 0, $1.since ?? .distantPast) }
@@ -811,8 +814,7 @@ final class MonitorView: NSView {
                 let agent = Line(alpha: fade(a.id)).add(last ? "    └─ " : "    ├─ ", Theme.dim)
                     .add(spinPhase ? "◐ " : "◓ ", Theme.warn)
                     .add(sanitize(a.type, 20), Theme.text)
-                if let action = a.action { agent.add(": ", Theme.dim).add(sanitize(action, 40), Theme.dim) }
-                agent.add(" · ", Theme.dim).add(duration(now.timeIntervalSince(a.start)), Theme.warn)
+                agent.add(a.action.map { ": \(sanitize($0, 40)) · " } ?? " · ", Theme.dim).add(duration(now.timeIntervalSince(a.start)), Theme.warn)
                 lines.append(agent.tip(agentTip(a) + (a.action.map { ["Now: \($0)"] } ?? [])))
             }
             if n.agents.count > 3 { lines.append(Line().add("    └─ +\(n.agents.count - 3) more", Theme.dim)) }

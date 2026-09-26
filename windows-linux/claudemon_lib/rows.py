@@ -247,13 +247,15 @@ def now_lines(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> L
             asegs = [
                 Seg("    " + branch, "dim"),
                 Seg("◐ " if spin_phase else "◓ ", "warn"),
-                Seg(fmt.clip_text(fmt.sanitize(a.type), 20) + (":" if ag.action is not None else ""), "text"),
+                Seg(fmt.clip_text(fmt.sanitize(a.type), 20), "text"),
             ]
             atip = _agent_tip(a, now)
-            if ag.action is not None:  # F2: no ": <action>" without an action
-                asegs.append(Seg(" " + fmt.clip_text(ag.action, AGENT_ACTION_CAP), "dim"))
+            if ag.action is not None:  # F2: no ": <action>" without an action; G6: the ":" is dim
+                asegs.append(Seg(": " + fmt.clip_text(ag.action, AGENT_ACTION_CAP) + " · ", "dim"))
                 atip.append(f"Now: {ag.action}")
-            asegs.append(Seg(" · " + fmt.duration(now - a.start), "warn"))
+            else:
+                asegs.append(Seg(" · ", "dim"))
+            asegs.append(Seg(fmt.duration(now - a.start), "warn"))
             out.append(Line(asegs, atip, anim.fade(a.id, now)))
         if ses.more_agents > 0:
             out.append(Line([Seg(f"    └─ +{ses.more_agents} more", "dim")]))

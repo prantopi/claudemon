@@ -169,7 +169,6 @@ class ActionRulesTest(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.t(p).action, THINKING)  # mid-turn text
         self.assertAlmostEqual(self.t(p).action_time, NOW - 10, delta=0.01)
-        self.assertFalse(self.t(p).action_from_tool)
         write_lines(p, [assistant(NOW - 5, [text()], "end_turn")])
         self.refresh()
         self.assertEqual(self.t(p).action, WAITING)
@@ -219,7 +218,6 @@ class ActionRulesTest(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.t(p).action, WAITING)
         self.assertAlmostEqual(self.t(p).action_time, NOW - 20, delta=0.01)
-        self.assertFalse(self.t(p).action_from_tool)
         write_lines(p, [user(NOW - 10), user(NOW - 9, "[Request interrupted by user]")])
         self.refresh()
         self.assertEqual(self.t(p).action, WAITING)
@@ -290,6 +288,49 @@ class ActionRulesTest(unittest.TestCase):
         self.assertEqual(self.t(self.main("S1")).session_id, "S1")
         self.assertEqual(self.t(a).session_id, "S1")
 
+
+    def test_synthetic_text_is_done(self) -> None:  # G1
+        p = self.main()
+        write_lines(p, [user(NOW - 30), assistant(NOW - 20, [text("Session limit reached")], "stop_sequence",
+                                                   model="<synthetic>")])
+        self.refresh()
+        self.assertEqual(self.t(p).action, WAITING)
+        a = self.agent("agent-a")
+        write_lines(a, [user(NOW - 30), assistant(NOW - 20, [{"type": "thinking"}, text("API Error")], None,
+                                                   model="<synthetic>")])
+        self.refresh()
+        self.assertEqual(self.t(a).action, FINISHED)
+        write_lines(p, [assistant(NOW - 10, [text("mid-turn")], "stop_sequence")])  # not synthetic
+        self.refresh()
+        self.assertEqual(self.t(p).action, THINKING)
+
+    def test_compact_summary_skipped(self) -> None:  # G2
+        p = self.main()
+        write_lines(p, [assistant(NOW - 30, [text()], "end_turn")])
+        summary = json.dumps({"type": "user", "isCompactSummary": True, "timestamp": iso(NOW - 20),
+                              "message": {"role": "user", "content": [text("This session is being continued")]}})
+        write_lines(p, [summary + "\n"])
+        self.refresh()
+        self.assertEqual(self.t(p).action, WAITING)
+        self.assertAlmostEqual(self.t(p).action_time, NOW - 30, delta=0.01)
+
+    def test_user_line_without_message_ignored(self) -> None:  # G3
+        p = self.main()
+        write_lines(p, [assistant(NOW - 30, [text()], "end_turn"),
+                        json.dumps({"type": "user", "timestamp": iso(NOW - 20)}) + "\n",
+                        json.dumps({"type": "user", "timestamp": iso(NOW - 15), "message": "hi"}) + "\n"])
+        self.refresh()
+        self.assertEqual(self.t(p).action, WAITING)
+        self.assertAlmostEqual(self.t(p).action_time, NOW - 30, delta=0.01)
+
+    def test_mixed_content_list_finds_tool_use(self) -> None:  # G4
+        p = self.main()
+        write_lines(p, [assistant(NOW - 20, ["junk", 3, None, tool("Read", file_path="/x/a.py"), ["x"]], "tool_use")])
+        self.refresh()
+        self.assertEqual(self.t(p).action, "Reading a.py")
+        write_lines(p, [assistant(NOW - 10, [7, text()], "end_turn")])
+        self.refresh()
+        self.assertEqual(self.t(p).action, WAITING)
 
 def _write_session(home: Path, pid: int, sid: str, status: Optional[str] = None, cwd: str = "/Users/me/app",
                    name: str = "") -> None:
@@ -407,6 +448,24 @@ def _span(i: int, start: float) -> Span:
     return Span(id="a%d" % i, type="Explore", task="t", family="opus", start=start, end=NOW, tokens=10, running=True)
 
 
+    def test_tooltip_fields_sanitised(self) -> None:  # G5
+        self.alive = {100, 101}
+        _write_session(self.home, 100, "S1", "bu\u202esy\n", "/Users/me/a\u200bpp\x07/" + "d" * 300, "my\nses\u202esion")
+        _write_session(self.home, 101, "S2", "idle", "/Users/me/\u200b")
+        self.refresh()
+        s = self.store.snapshot(TimeRange.HOUR, now=NOW)
+        s1 = [n for n in s.now_sessions if n.session_id == "S1"][0]
+        s2 = [n for n in s.now_sessions if n.session_id == "S2"][0]
+        self.assertEqual(s1.name, "my ses sion")
+        self.assertEqual(s1.status, "bu sy")
+        self.assertEqual(len(s1.cwd), 200)
+        self.assertTrue(s1.cwd.startswith("/Users/me/a pp /") and s1.cwd.endswith("…"))
+        self.assertEqual(len(s1.project), 200)
+        self.assertEqual(s2.project, "?")  # empty after sanitising
+        line = now_lines(Snapshot(loaded=True, now_sessions=(s2,)), Animator(), NOW, True)[0]
+        self.assertTrue(text_of(line).startswith("  ● ? "))
+        self.assertEqual(line.tip[0], "?")
+
 class NowBlockRowsTest(unittest.TestCase):
     def ses(self, sid: str, agents: int = 0, more: int = 0, busy: bool = True) -> NowSession:
         ags = tuple(NowAgent(_span(i, NOW - 65), "Reading a.py", NOW - 3) for i in range(agents))
@@ -434,6 +493,9 @@ class NowBlockRowsTest(unittest.TestCase):
         self.assertIn("since " + fmt.clock(NOW - 12), tip)
         self.assertEqual(rows[2].tip[:2], ["Explore", "t"])
         self.assertEqual(rows[2].tip[-1], "Now: Reading a.py")  # F3
+        # G6: "<type>" normal, ": <action> · " dim, run time warn
+        self.assertEqual([(seg.text, seg.role) for seg in rows[2].segs[2:]],
+                         [("Explore", "text"), (": Reading a.py · ", "dim"), ("1m5s", "warn")])
 
     def test_caps_and_more_lines(self) -> None:
         snap = Snapshot(loaded=True, now_sessions=(self.ses("S1", agents=3, more=2), self.ses("S2", busy=False)),
@@ -461,6 +523,8 @@ class NowBlockRowsTest(unittest.TestCase):
         line = now_lines(Snapshot(loaded=True, now_sessions=(ses,)), Animator(), NOW, True)[1]
         self.assertEqual(text_of(line), "    └─ ◐ Explore · 1m5s")  # F2: no ":" without an action
         self.assertFalse(any(t.startswith("Now:") for t in line.tip))
+        self.assertEqual([(seg.text, seg.role) for seg in line.segs[2:]],
+                         [("Explore", "text"), (" · ", "dim"), ("1m5s", "warn")])
 
     def test_clipping_at_row_time(self) -> None:
         long = "Using " + "s" * 39 + "…: " + "t" * 39 + "…"

@@ -82,6 +82,7 @@ UPDATED_SLACK = 60.0  # updated_at may be at most this far in the future (clock 
 BUSY_SECONDS = 20.0  # the busy fallback when a session's status is missing
 NOW_SESSIONS_MAX = 3
 NOW_AGENTS_MAX = 3
+TIP_CAP = 200  # session tooltip fields (G5)
 
 
 def _value(v: Any) -> Optional[str]:
@@ -191,36 +192,38 @@ def _interrupted(content: Any, depth: int = 0) -> bool:
     return False
 
 
-def _update_action(t: Transcript, kind: Any, msg: Any, ts: Any, meta: Any = False) -> None:
-    """Advance t's current action for one assistant/user line (activity spec §1, amendment A).
+def _update_action(t: Transcript, kind: Any, msg: Dict[str, Any], ts: Any, skip: bool = False) -> None:
+    """Advance t's current action for one assistant/user line (activity spec §1, amendments A and G).
 
     A line without a valid timestamp still updates the action; its time is then unknown (F8)."""
-    if meta is True:
-        return
-    content = msg.get("content") if isinstance(msg, dict) else None
+    if skip:
+        return  # isMeta or isCompactSummary (G2)
+    content = msg.get("content")
     if isinstance(content, str) and content.startswith(("<local-command", "<command-")):
         return  # slash-command noise, compact summaries
     when = parse_timestamp(ts) if isinstance(ts, str) else None
     done = FINISHED if t.is_agent else WAITING
     if kind == "assistant":
-        blocks = content if isinstance(content, list) else []
-        tools = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        # G4: skip non-object items and evaluate the rest
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        tools = [b for b in blocks if b.get("type") == "tool_use"]
         if tools:
-            t.action, t.action_time, t.action_from_tool = tool_action(tools[-1]), when, True
-            return
-        rest = [b for b in blocks if not (isinstance(b, dict) and b.get("type") == "thinking")]
-        text_only = len(rest) > 0 and all(isinstance(b, dict) and b.get("type") == "text" for b in rest)
-        if text_only and msg.get("stop_reason") == "end_turn":
-            t.action = done
+            t.action = tool_action(tools[-1])
         else:
-            t.action = THINKING  # thinking only, or text in the middle of a turn
-        t.action_time, t.action_from_tool = when, False
+            rest = [b for b in blocks if b.get("type") != "thinking"]
+            text_only = len(rest) > 0 and all(b.get("type") == "text" for b in rest)
+            # G1: a synthetic text reply (session limit, API error) ends the turn whatever its stop_reason
+            if text_only and (msg.get("stop_reason") == "end_turn" or msg.get("model") == "<synthetic>"):
+                t.action = done
+            else:
+                t.action = THINKING  # thinking only, or text in the middle of a turn
     elif _interrupted(content):  # checked before the tool_result-only rule
-        t.action, t.action_time, t.action_from_tool = done, when, False
+        t.action = done
     elif _only_tool_results(content):
         return  # the tool just returned: keep the action and its time
     else:
-        t.action, t.action_time, t.action_from_tool = THINKING, when, False
+        t.action = THINKING
+    t.action_time = when
 
 
 # ---- live sessions and official limits (activity spec §2, §3) -------------------------------------
@@ -489,8 +492,8 @@ class Store:
         msg = obj.get("message")
         kind = obj.get("type")
         ts = obj.get("timestamp")
-        if kind == "user" or (kind == "assistant" and isinstance(msg, dict)):
-            _update_action(t, kind, msg, ts, obj.get("isMeta"))
+        if kind in ("user", "assistant") and isinstance(msg, dict):  # G3: no message, no change
+            _update_action(t, kind, msg, ts, obj.get("isMeta") is True or obj.get("isCompactSummary") is True)
         if kind != "assistant" or not isinstance(msg, dict):
             return
         u = msg.get("usage")
@@ -700,7 +703,7 @@ class Store:
                 busy = info["status"] == "busy"
             else:
                 busy = t is not None and t.mtime is not None and now - t.mtime < BUSY_SECONDS
-            cwd = sanitize(info["cwd"])
+            cwd = clip_text(sanitize(info["cwd"]), TIP_CAP)
             project = project_name(info["cwd"]) if info["cwd"] else (t.project if t is not None else "?")
             agents = sorted(running.get(sid, []) if sid else [], key=lambda x: x.start, reverse=True)
             now_agents = []
@@ -710,10 +713,10 @@ class Store:
             out.append(
                 NowSession(
                     session_id=sid,
-                    project=sanitize(project) or "?",
-                    name=sanitize(info["name"]),
+                    project=clip_text(sanitize(project), TIP_CAP) or "?",  # G5
+                    name=clip_text(sanitize(info["name"]), TIP_CAP),
                     cwd=cwd,
-                    status=sanitize(info["status"]),
+                    status=clip_text(sanitize(info["status"]), TIP_CAP),
                     busy=busy,
                     action=t.action if t is not None else None,
                     action_time=t.action_time if t is not None else None,
