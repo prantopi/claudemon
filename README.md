@@ -1,20 +1,28 @@
 # Claudemon
 
+**See what Claude Code is doing. Live.**
+
+Sessions · Agents · Tokens · Speed · Models · Limits
+
+A tiny floating window for macOS, Windows and Linux that shows what every Claude Code session and agent is doing right now, read from Claude Code's local logs. Nothing leaves your computer.
+
 > **Community project, not affiliated with or endorsed by Anthropic.** "Claude" and "Claude Code" are trademarks of Anthropic.
 
-A tiny floating dashboard for your [Claude Code](https://code.claude.com) usage on macOS: tokens, speed, models, subagents and projects, updated every second.
-
-![Claudemon showing sessions, tokens, speed, models, agents, projects, a 24-hour chart with main-session and agent lines, and an agent timeline](docs/screenshot.png)
+![Claudemon showing live sessions with their agents, token usage and a tokens-per-minute chart](docs/demo.gif)
 
 ## What it shows
+
+![Claudemon showing sessions, tokens, speed, models, agents, projects, a 24-hour chart with main-session and agent lines, and an agent timeline](docs/screenshot.png)
 
 | Row | Meaning |
 |-----|---------|
 | **Sessions** | Claude Code sessions running now, how many are busy, and the context size of your latest conversation |
+| **Now** | Each live session's current action (for example `Editing app.py` or `Running tests`) and how long it's been doing it, with that session's running agents nested underneath |
 | **Tokens** | Tokens used today and in the current 5-hour window, split into input, output and cache reads |
 | **Speed** | Tokens per minute right now, and the peak minute in the last hour |
 | **Models** | Share of today's tokens by model (opus, sonnet, haiku, fable) |
-| **Agents** | Subagents running now and run today, each with its type, task, tokens and run time |
+| **Agents** | How many subagents are running now, and the ones run today, each with its type, task, tokens and run time |
+| **Limits** | Your official 5-hour and weekly usage and reset times. Shown only when the optional status-line bridge is set up. |
 | **Projects** | The projects that used the most tokens today |
 | **Chart** | Tokens per minute over the last **1h, 5h or 24h**, with separate lines for your main session and for subagents |
 | **Activity** | The **7d** view: a heatmap of tokens per hour over the last 7 days |
@@ -54,18 +62,37 @@ To start it automatically, add `Claudemon.app` under System Settings → General
 
 Claudemon remembers its position, time range, theme and compact mode between launches.
 
+## Official usage limits (optional)
+
+Claude Code's status line receives your official 5-hour and weekly usage percentages for Pro and Max plans. Claudemon can't see them on its own, so a small bridge script sits in front of your status line, saves those numbers to a local file, and passes everything else through unchanged.
+
+Add this to your `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /path/to/claudemon/statusline/claudemon_statusline.py"
+  }
+}
+```
+
+If you already have a status-line command, pass it as an argument instead of replacing it, and the bridge runs it and prints its output as before.
+
+The script only saves those numbers to a local file (`~/.claude/claudemon/limits.json`) and makes no network requests. See [`statusline/README.md`](statusline/README.md) for Windows notes and full setup details.
+
 ## How it works
 
-Claude Code saves every conversation on your Mac in `~/.claude/projects/`, including exact token counts for each reply. Claudemon reads the last 7 days of those files at launch, then only the new lines each second. It also checks `~/.claude/sessions/` to see which sessions are running.
+Claude Code saves every conversation on your computer in `~/.claude/projects/`, including exact token counts for each reply. Claudemon reads the last 7 days of those files at launch, then only the new lines each second, reading each session's latest action (which tool is running, or that it's waiting or thinking) from those same logs. It also checks `~/.claude/sessions/` to see which sessions are running, and, when the status-line bridge is set up, `~/.claude/claudemon/limits.json` for your official usage limits.
 
-**Nothing leaves your Mac.** Claudemon makes no network requests and needs no API key or login.
+**Nothing leaves your computer.** Claudemon makes no network requests and needs no API key or login.
 
 ## Limitations
 
-- **The 5-hour window is an estimate.** It starts at your first message after a 5-hour gap. Your actual plan limits aren't stored locally, so Claudemon can't show a percentage of your limit.
+- **Without the status-line bridge, the Tokens row's 5-hour window is an estimate.** It starts at your first message after a 5-hour gap. With the bridge set up (Pro and Max plans), Claudemon shows Claude Code's official usage percentages instead, in the Limits row. See [`statusline/README.md`](statusline/README.md) for setup.
 - **No cost in dollars.** Prices differ by model and change over time, so Claudemon shows tokens only.
 - **Cache reads dominate the totals.** That's normal: Claude re-reads your conversation's context on every reply. The `out` figure is what Claude actually wrote.
-- **macOS only.** It's a native Swift app.
+- **The native app is macOS only.** It's a native Swift app. Windows and Linux run the Python port below.
 
 ## Windows and Linux
 
