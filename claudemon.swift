@@ -31,7 +31,7 @@ final class Transcript {
     var lastContext = 0
     var lastReply: Date?
     var session = ""           // main: its own id; subagent: the main session it belongs to
-    var action: String?        // what it is doing now (see noteAssistant)
+    var action: String?        // what it is doing now (see noteAction)
     var actionTime: Date?
     var actionIsTool = false
     // subagents only
@@ -175,15 +175,8 @@ final class Store {
         for line in data.split(separator: 0x0A) {
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
             if t.project == "?", let cwd = obj["cwd"] as? String { t.project = Store.projectName(cwd) } // where the session started
-            let type = obj["type"] as? String
             let lineTime = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) }
-            if type == "assistant", let msg = obj["message"] as? [String: Any] {
-                noteAssistant(msg, t, lineTime)
-            } else if type == "user", !t.actionIsTool {
-                // A prompt or tool results: the model is working on it. A running tool keeps its action.
-                t.action = "Thinking…"
-                t.actionTime = lineTime
-            }
+            noteAction(obj, t, lineTime)
             guard obj["type"] as? String == "assistant",
                   let msg = obj["message"] as? [String: Any],
                   let u = msg["usage"] as? [String: Any],
@@ -202,19 +195,51 @@ final class Store {
         }
     }
 
-    /// Updates a transcript's current action from one assistant line.
-    private func noteAssistant(_ msg: [String: Any], _ t: Transcript, _ time: Date?) {
-        let content = msg["content"] as? [[String: Any]] ?? []
-        if let use = content.last(where: { $0["type"] as? String == "tool_use" }) {
-            t.action = Store.toolAction(use["name"] as? String ?? "", use["input"] as? [String: Any] ?? [:])
-            t.actionTime = time
-            t.actionIsTool = true
-        } else if !content.isEmpty, content.allSatisfy({ $0["type"] as? String == "text" }),
-                  msg["stop_reason"] as? String == "end_turn" {
-            t.action = t.isAgent ? "Finished" : "Waiting for you"
-            t.actionTime = time
-            t.actionIsTool = false
+    /// Updates a transcript's current action from one user or assistant line.
+    private func noteAction(_ obj: [String: Any], _ t: Transcript, _ time: Date?) {
+        let type = obj["type"] as? String
+        guard type == "assistant" || type == "user", obj["isMeta"] as? Bool != true,
+              let msg = obj["message"] as? [String: Any] else { return }
+        if let text = msg["content"] as? String, text.hasPrefix("<local-command") || text.hasPrefix("<command-") {
+            return  // slash-command noise and compact summaries
         }
+        let content = msg["content"] as? [[String: Any]] ?? []
+        func set(_ action: String, tool: Bool = false) {
+            t.action = action
+            t.actionTime = time
+            t.actionIsTool = tool
+        }
+        let done = t.isAgent ? "Finished" : "Waiting for you"
+        if type == "assistant" {
+            let blocks = content.filter { $0["type"] as? String != "thinking" }
+            if let use = content.last(where: { $0["type"] as? String == "tool_use" }) {
+                set(Store.toolAction(use["name"] as? String ?? "", use["input"] as? [String: Any] ?? [:]), tool: true)
+            } else if !blocks.isEmpty, blocks.allSatisfy({ $0["type"] as? String == "text" }),
+                      msg["stop_reason"] as? String == "end_turn" {
+                set(done)
+            } else {
+                set("Thinking…")
+            }
+            return
+        }
+        // user line: an interruption, tool results, or a prompt
+        if Store.userText(msg["content"]).contains("[Request interrupted by user") {
+            set(done)
+        } else if !content.isEmpty, content.allSatisfy({ $0["type"] as? String == "tool_result" }) {
+            // the tool just returned: keep its action until the next assistant line
+        } else {
+            set("Thinking…")
+        }
+    }
+
+    /// All text in a user message's content: a string, or its text blocks and tool results.
+    static func userText(_ content: Any?) -> String {
+        if let s = content as? String { return s }
+        guard let blocks = content as? [[String: Any]] else { return "" }
+        return blocks.map { b in
+            if let text = b["text"] as? String { return text }
+            return userText(b["content"])
+        }.joined(separator: "\n")
     }
 
     /// Describes a tool call in a few words. Every value taken from the transcript is untrusted and clipped.
@@ -224,7 +249,7 @@ final class Store {
             return clean.isEmpty ? nil : clean
         }
         func field(_ key: String) -> String? { value(input[key] as? String) }
-        func file(_ key: String) -> String? { value((input[key] as? String).map { ($0 as NSString).lastPathComponent }) }
+        func file(_ key: String) -> String? { value((input[key] as? String).map(basename)) }
         let found: String?
         switch name {
         case "Edit", "MultiEdit": found = file("file_path").map { "Editing \($0)" }
@@ -257,7 +282,7 @@ final class Store {
     /// so those count toward the project they belong to.
     static func projectName(_ cwd: String) -> String {
         let root = cwd.components(separatedBy: "/.claude/worktrees/").first ?? cwd
-        return (root as NSString).lastPathComponent
+        return basename(root)
     }
 
     /// Sessions whose process is alive, with what `~/.claude/sessions/<pid>.json` says about them.
@@ -278,15 +303,18 @@ final class Store {
         guard let data = try? fh.read(upToCount: 65537), data.count <= 65536,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               Store.number(obj["version"]) == 1,
-              let updated = Store.number(obj["updated_at"]) else { return nil }
+              let updated = Store.number(obj["updated_at"]),
+              updated > 0, updated <= now.timeIntervalSince1970 + 60 else { return nil }
         var windows: [LimitWindow?] = []
         for key in ["five_hour", "seven_day"] {
-            guard let raw = obj[key] else { windows.append(nil); continue }
+            guard let raw = obj[key], !(raw is NSNull) else { windows.append(nil); continue }
             guard let w = raw as? [String: Any],
                   let pct = Store.number(w["used_percentage"]), (0...100).contains(pct),
                   let resets = Store.number(w["resets_at"]), resets > 0 else { return nil }
             let window = LimitWindow(percent: pct, resets: Date(timeIntervalSince1970: resets))
-            windows.append(window.resets > now ? window : nil)  // a window counts only until it resets
+            // a window counts only until it resets, and never more than 8 days ahead
+            let ahead = window.resets.timeIntervalSince(now)
+            windows.append(ahead > 0 && ahead <= 8 * 86400 ? window : nil)
         }
         guard windows.contains(where: { $0 != nil }) else { return nil }
         return Limits(updated: Date(timeIntervalSince1970: updated), fiveHour: windows[0], week: windows[1])
@@ -309,7 +337,6 @@ final class Store {
         s.limits = readLimits(now: now)
 
         let mains = transcripts.filter { !$0.value.isAgent }
-        s.busySessions = min(s.liveSessions, mains.values.filter { now.timeIntervalSince($0.mtime) < 20 }.count)
         if let current = mains.values.filter({ $0.lastReply != nil }).max(by: { $0.mtime < $1.mtime }) {
             s.context = current.lastContext
             s.contextProject = current.project
@@ -414,14 +441,15 @@ final class Store {
         s.now = live.map { info in
             let id = info["sessionId"] as? String ?? ""
             let t = id.isEmpty ? nil : mainById[id]
-            let status = info["status"] as? String
+            let status = (info["status"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             let cwd = info["cwd"] as? String ?? ""
             let busy = status.map { $0 == "busy" } ?? t.map { now.timeIntervalSince($0.mtime) < 20 } ?? false
             return NowSession(project: cwd.isEmpty ? t?.project ?? "?" : Store.projectName(cwd),
                               name: info["name"] as? String ?? "", cwd: cwd, status: status ?? "", busy: busy,
                               action: t?.action, since: t?.actionTime,
-                              agents: spans.filter { $0.running && !id.isEmpty && $0.session == id }.sorted { $0.start < $1.start })
+                              agents: spans.filter { $0.running && !id.isEmpty && $0.session == id }.sorted { $0.start > $1.start })
         }.sorted { ($0.busy ? 1 : 0, $0.since ?? .distantPast) > ($1.busy ? 1 : 0, $1.since ?? .distantPast) }
+        s.busySessions = s.now.filter { $0.busy }.count  // same rule as the Now dots
         return s
     }
 
@@ -544,18 +572,25 @@ func clip(_ s: String, _ n: Int) -> String {
     s.count <= n ? s.padding(toLength: n, withPad: " ", startingAt: 0) : String(s.prefix(n - 1)) + "…"
 }
 
-/// Untrusted text for one line: control characters become spaces, runs of spaces collapse, clipped to n with "…".
+/// Untrusted text for one line: control, format and separator characters (Cc, Cf, Zl, Zp: bidi overrides,
+/// zero-width characters) and all whitespace become single spaces, trimmed, clipped to n scalars with "…".
 func sanitize(_ s: String, _ n: Int) -> String {
-    var out = ""
-    for ch in s {
-        if ch == " " || ch.isNewline || ch.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) {
-            if !out.isEmpty && out.last != " " { out.append(" ") }
-        } else {
-            out.append(ch)
+    var out = String.UnicodeScalarView()
+    for u in s.unicodeScalars {
+        switch u.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator: break
+        default:
+            if !u.properties.isWhitespace { out.append(u); continue }
         }
+        if !out.isEmpty && out.last != " " { out.append(" ") }
     }
     if out.last == " " { out.removeLast() }
-    return out.count <= n ? out : String(out.prefix(n - 1)) + "…"
+    return out.count <= n ? String(out) : String(String.UnicodeScalarView(out.prefix(n - 1))) + "…"
+}
+
+/// The last path component, splitting on both "/" and "\\".
+func basename(_ path: String) -> String {
+    String(path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last ?? "")
 }
 
 func duration(_ seconds: TimeInterval) -> String {
@@ -674,7 +709,7 @@ final class MonitorView: NSView {
             ses.add(" · ctx ", Theme.dim).add(tokens(ctx)).add(" \(clip(s.contextProject, 16).trimmingCharacters(in: .whitespaces))", Theme.dim)
         }
         ses.tip(["Sessions",
-                 "\(s.liveSessions) running now, \(s.busySessions) active in the last 20s",
+                 "\(s.liveSessions) running now, \(s.busySessions) busy",
                  s.context > 0 ? "Latest conversation: \(exact(s.context)) tokens of context (\(s.contextProject))" : "No conversation yet"])
         lines.append(ses)
         lines += nowRows()
@@ -758,9 +793,9 @@ final class MonitorView: NSView {
         var lines: [Line] = []
         for n in snap.now.prefix(3) {
             let row = Line().add("  ").add("● ", n.busy ? Theme.warn : Theme.dim)
-                .add(clip(n.project, 16).trimmingCharacters(in: .whitespaces), Theme.fg)
+                .add(sanitize(n.project, 16), Theme.text)
             if let action = n.action {
-                row.add(" · ", Theme.dim).add(sanitize(action, 56))
+                row.add(" · ", Theme.dim).add(sanitize(action, 48), Theme.dim)
             }
             if let since = n.since { row.add(" · ", Theme.dim).add(duration(now.timeIntervalSince(since)), Theme.dim) }
             var tip = [n.project]
@@ -776,7 +811,7 @@ final class MonitorView: NSView {
                 let agent = Line(alpha: fade(a.id)).add(last ? "    └─ " : "    ├─ ", Theme.dim)
                     .add(spinPhase ? "◐ " : "◓ ", Theme.warn)
                     .add(sanitize(a.type, 20), Theme.text)
-                if let action = a.action { agent.add(": ", Theme.dim).add(sanitize(action, 56)) }
+                if let action = a.action { agent.add(": ", Theme.dim).add(sanitize(action, 40), Theme.dim) }
                 agent.add(" · ", Theme.dim).add(duration(now.timeIntervalSince(a.start)), Theme.warn)
                 lines.append(agent.tip(agentTip(a) + (a.action.map { ["Now: \($0)"] } ?? [])))
             }
