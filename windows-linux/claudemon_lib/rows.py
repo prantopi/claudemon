@@ -5,6 +5,7 @@ claudemon.swift 508-602. `Seg`, `Line`, `TITLE_DOTS` and `SPARKS` are real (draw
 """
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass, field
 from typing import List
 
@@ -12,7 +13,7 @@ from . import formatting as fmt
 from . import layout
 from . import theme
 from .animation import Animator
-from .model import Snapshot, Span
+from .model import Limits, Snapshot, Span
 
 
 @dataclass
@@ -37,6 +38,8 @@ TITLE_DOTS: List[Seg] = [
 ]
 
 SPARKS = "▁▂▃▄▅▆▇█"
+
+ACTION_CAP = 56  # activity spec §1: the whole action, clipped at display time
 
 
 def _label(text: str) -> Seg:
@@ -73,6 +76,9 @@ def build_rows(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> 
     ]
     lines.append(Line(ses_segs, ses_tip))
 
+    # 1b. "Now" block: live sessions with their running agents (activity spec §2)
+    lines += now_lines(snap, now, spin_phase)
+
     # 2. Tokens [claudemon.swift 524-534] and 3. in/out line [535-537]
     usage_tip = [
         f"Tokens today ({fmt.exact(snap.today_replies)} replies)",
@@ -107,6 +113,10 @@ def build_rows(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> 
         Seg(fmt.tokens(snap.today.cache_read), "text"),
     ]
     lines.append(Line(inout_segs, usage_tip))
+
+    # 3b. Official limits (activity spec §3)
+    if snap.limits is not None:
+        lines.append(limits_line(snap.limits, now))
 
     # 4. Speed [claudemon.swift 539-544]
     speed = anim.num("speed", snap.per_minute)
@@ -172,16 +182,7 @@ def build_rows(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> 
             Seg(" " + fmt.tokens(a.tokens).ljust(6), "text" if a.running else "dim"),
             Seg(fmt.duration(now - a.start) if a.running else "", "warn"),
         ]
-        # Note the "Ran " prefix here differs from span_tooltip (ui-spec.md §7 has none).
-        row_tip = [
-            a.type,
-            a.task or "(no description)",
-            f"Model: {a.family} · {fmt.exact(a.tokens)} tokens",
-            f"Running for {fmt.duration(now - a.start)}"
-            if a.running
-            else f"Ran {fmt.hm(a.start)}–{fmt.hm(a.end)} ({fmt.duration(a.end - a.start)})",
-        ]
-        lines.append(Line(row_segs, row_tip, anim.fade(a.id, now)))
+        lines.append(Line(row_segs, _agent_tip(a, now), anim.fade(a.id, now)))
 
     # 8. Projects [claudemon.swift 581-588]
     if snap.projects:
@@ -197,6 +198,121 @@ def build_rows(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> 
         lines.append(Line(proj_segs, proj_tip))
 
     return lines
+
+
+def _agent_tip(a: Span, now: float) -> List[str]:
+    """The Agents-row tooltip for one agent [claudemon.swift 568-579]."""
+    # Note the "Ran " prefix here differs from span_tooltip (ui-spec.md §7 has none).
+    return [
+        a.type,
+        a.task or "(no description)",
+        f"Model: {a.family} · {fmt.exact(a.tokens)} tokens",
+        f"Running for {fmt.duration(now - a.start)}"
+        if a.running
+        else f"Ran {fmt.hm(a.start)}–{fmt.hm(a.end)} ({fmt.duration(a.end - a.start)})",
+    ]
+
+
+def now_lines(snap: Snapshot, now: float, spin_phase: bool) -> List[Line]:
+    """The "Now" block (activity spec §2): one line per live session, each followed by its running
+    subagents as a small tree. Empty when no session is live."""
+    out: List[Line] = []
+    for ses in snap.now_sessions:
+        segs = [
+            Seg("  "),
+            Seg("● ", "warn" if ses.busy else "dim"),
+            Seg(fmt.clip(ses.project, 16).strip(), "text"),
+        ]
+        tip = [ses.project]
+        if ses.name:
+            tip.append(f"Session: {ses.name}")
+        if ses.cwd:
+            tip.append(ses.cwd)
+        tip.append(f"Status: {ses.status or ('busy' if ses.busy else 'idle')}")
+        if ses.action is not None:
+            segs.append(Seg(" · ", "dim"))
+            segs.append(Seg(fmt.clip_text(ses.action, ACTION_CAP), "fg" if ses.busy else "dim"))
+            tip.append(ses.action)
+        if ses.action_time is not None:
+            segs.append(Seg(" · " + fmt.duration(now - ses.action_time), "dim"))
+            tip.append(f"since {fmt.clock(ses.action_time)}")
+        out.append(Line(segs, tip))
+
+        last = len(ses.agents) - 1
+        for i, ag in enumerate(ses.agents):
+            a = ag.span
+            branch = "└─ " if i == last and ses.more_agents == 0 else "├─ "
+            asegs = [
+                Seg("    " + branch, "dim"),
+                Seg("◐ " if spin_phase else "◓ ", "warn"),
+                Seg(fmt.clip_text(fmt.sanitize(a.type), 20) + ":", "text"),
+            ]
+            atip = _agent_tip(a, now)
+            if ag.action is not None:
+                asegs.append(Seg(" " + fmt.clip_text(ag.action, ACTION_CAP), "dim"))
+                atip.append(ag.action)
+            asegs.append(Seg(" · " + fmt.duration(now - a.start), "warn"))
+            out.append(Line(asegs, atip))
+        if ses.more_agents > 0:
+            out.append(Line([Seg(f"    └─ +{ses.more_agents} more", "dim")]))
+    if snap.more_sessions > 0:
+        out.append(Line([Seg(f"  +{snap.more_sessions} more sessions", "dim")]))
+    return out
+
+
+def _pct_role(pct: int) -> str:
+    """Meter colours: normal below 70, warn from 70, hot from 90."""
+    if pct >= 90:
+        return "hot"
+    if pct >= 70:
+        return "warn"
+    return "text"
+
+
+def _local(t: float, pattern: str) -> str:
+    """Local time t formatted with strftime pattern; "?" when t is outside the platform's range
+    (resets_at comes from a user-writable file)."""
+    try:
+        return datetime.datetime.fromtimestamp(t).strftime(pattern)
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+def _long_reset(t: float) -> str:
+    """"Wed 1 Oct 02:52:00"."""
+    try:
+        d = datetime.datetime.fromtimestamp(t)
+    except (OverflowError, OSError, ValueError):
+        return "?"
+    return f"{fmt.day_long(d.date())} {d.strftime('%H:%M:%S')}"
+
+
+def limits_line(limits: Limits, now: float) -> Line:
+    """The Limits row (activity spec §3): only the windows present, percent rounded half-up."""
+    segs = [_label("Limits")]
+    tip = [
+        "Official Claude usage from Claude Code's status line",
+        f"Updated {int(max(0.0, now - limits.updated_at))}s ago",
+    ]
+    parts = (
+        ("5h", "5-hour", limits.five_hour, "%H:%M"),
+        ("week", "7-day", limits.seven_day, "%a %H:%M"),
+    )
+    first = True
+    for short, long_name, w, when in parts:
+        if w is None:
+            continue
+        pct = fmt.round_half_up(w.used_percentage)
+        if not first:
+            segs.append(Seg(" · ", "dim"))
+        first = False
+        segs += [
+            Seg(short + " ", "dim"),
+            Seg(f"{pct}%", _pct_role(pct), True),
+            Seg(" · resets " + _local(w.resets_at, when), "dim"),
+        ]
+        tip.append(f"{long_name}: {w.used_percentage:g}% used · resets {_long_reset(w.resets_at)}")
+    return Line(segs, tip)
 
 
 def compact_summary(snap: Snapshot, anim: Animator, spin_phase: bool) -> List[Seg]:

@@ -6,12 +6,14 @@ import os
 import posixpath
 import sys
 from pathlib import Path
+from typing import Optional
 
 IS_WINDOWS: bool = sys.platform == "win32"
 IS_LINUX: bool = sys.platform.startswith("linux")
 
 APP_DIR_NAME = "claudemon"
 SETTINGS_FILE_NAME = "settings.json"
+LIMITS_FILE_NAME = "limits.json"
 
 
 def claude_home() -> Path:
@@ -33,3 +35,8 @@ def settings_path() -> Path:
         xdg = os.environ.get("XDG_CONFIG_HOME", "")
         base = Path(xdg) if xdg and posixpath.isabs(xdg) else Path.home() / ".config"
     return base / APP_DIR_NAME / SETTINGS_FILE_NAME
+
+
+def limits_path(home: Optional[Path] = None) -> Path:
+    """<claude home>/claudemon/limits.json, written by the status-line bridge (activity spec §3)."""
+    return (claude_home() if home is None else Path(home)) / APP_DIR_NAME / LIMITS_FILE_NAME

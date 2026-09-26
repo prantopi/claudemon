@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import unicodedata
 
 
 def tokens(n: int) -> str:
@@ -28,6 +29,23 @@ def exact(n: int) -> str:
 def clip(s: str, n: int) -> str:
     """s.ljust(n) if len(s) <= n else s[:n-1] + "…"."""
     return s.ljust(n) if len(s) <= n else s[: n - 1] + "…"
+
+
+def clip_text(s: str, n: int) -> str:
+    """s if it fits in n characters, else its first n-1 characters + "…" (no padding)."""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def sanitize(s: str) -> str:
+    """Untrusted text for one line: newlines and control/format characters become spaces, runs of
+    whitespace collapse to one space, and the ends are trimmed."""
+    out = []
+    for ch in s:
+        if ch in "\n\r\t" or unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
+            out.append(" ")
+        else:
+            out.append(ch)
+    return " ".join("".join(out).split())
 
 
 def duration(seconds: float) -> str:

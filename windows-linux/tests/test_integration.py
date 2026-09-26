@@ -264,7 +264,10 @@ class IntegrationCase(unittest.TestCase):
         anim = Animator()
         anim.apply(s, now=NOW, reduce_motion=True)  # shown snaps straight to target
         rows = build_rows(s, anim, now=NOW, spin_phase=True)
-        self.assertEqual(len(rows), 8)  # Sessions, Tokens, in/out, Speed, Models, Agents, 1 agent row, Projects
+        # Sessions, 1 "Now" line (pid 4242 is live), Tokens, in/out, Speed, Models, Agents, 1 agent row, Projects
+        self.assertEqual(len(rows), 9)
+        now_line = rows.pop(1)
+        self.assertTrue("".join(seg.text for seg in now_line.segs).startswith("  ● "))
 
         sessions_text = "".join(seg.text for seg in rows[0].segs)
         self.assertIn("1 busy", sessions_text)

@@ -51,6 +51,10 @@ class Transcript:
     last_reply: Optional[float] = None
     agent_type: str = "agent"
     agent_task: str = ""
+    session_id: str = ""  # main: the file stem; subagent: the <sessionId> folder above subagents/
+    action: Optional[str] = None  # latest current action (activity spec §1), already sanitised
+    action_time: Optional[float] = None
+    action_from_tool: bool = False
 
 
 class TimeRange(IntEnum):
@@ -128,6 +132,47 @@ class ProjectTotal:
     tokens: int
 
 
+@dataclass(frozen=True)
+class NowAgent:
+    """A running subagent under its session in the "Now" block (activity spec §2)."""
+
+    span: Span
+    action: Optional[str]
+    action_time: Optional[float]
+
+
+@dataclass(frozen=True)
+class NowSession:
+    """A live session in the "Now" block (activity spec §2). Text fields are sanitised."""
+
+    session_id: str
+    project: str
+    name: str
+    cwd: str
+    status: str
+    busy: bool
+    action: Optional[str]
+    action_time: Optional[float]
+    agents: Tuple[NowAgent, ...] = ()
+    more_agents: int = 0
+
+
+@dataclass(frozen=True)
+class LimitWindow:
+    used_percentage: float
+    resets_at: float
+
+
+@dataclass(frozen=True)
+class Limits:
+    """Official usage limits from ~/.claude/claudemon/limits.json (activity spec §3). Only windows
+    whose resets_at is still in the future are kept; at least one of them is set."""
+
+    updated_at: float
+    five_hour: Optional[LimitWindow] = None
+    seven_day: Optional[LimitWindow] = None
+
+
 @dataclass
 class Snapshot:
     loaded: bool = False
@@ -154,6 +199,9 @@ class Snapshot:
     agents_today: List[Span] = field(default_factory=list)
     projects: List[ProjectTotal] = field(default_factory=list)
     now: float = 0.0
+    now_sessions: Tuple[NowSession, ...] = ()
+    more_sessions: int = 0
+    limits: Optional[Limits] = None
 
 
 def family(model: str) -> str:

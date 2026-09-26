@@ -11,15 +11,24 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
+import re
 import stat
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from .formatting import clip_text, sanitize
 
 from .model import (
+    Limits,
+    LimitWindow,
     ModelTotal,
+    NowAgent,
+    NowSession,
     ProjectTotal,
     Reply,
     Snapshot,
@@ -60,6 +69,220 @@ def _is_regular(path: str) -> Optional[os.stat_result]:
     return st if stat.S_ISREG(st.st_mode) else None
 
 
+# ---- current action (activity spec §1) -----------------------------------------------------------
+
+VALUE_CAP = 40  # every untrusted value inserted into an action
+ACTION_CAP = 56  # the whole action
+THINKING = "Thinking…"
+WAITING = "Waiting for you"
+FINISHED = "Finished"
+_SESSION_JSON_CAP = 64 * 1024
+LIMITS_CAP = 64 * 1024
+NOW_SESSIONS_MAX = 3
+NOW_AGENTS_MAX = 3
+
+
+def _value(v: Any) -> Optional[str]:
+    """A sanitised, clipped string field of a tool input, or None when missing/empty."""
+    if not isinstance(v, str):
+        return None
+    s = clip_text(sanitize(v), VALUE_CAP)
+    return s or None
+
+
+def _base(v: Any) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    return _value(re.split(r"[\\/]", v.rstrip("/\\"))[-1])
+
+
+def _host(v: Any) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    try:
+        return _value(urllib.parse.urlsplit(v.strip()).hostname)
+    except ValueError:
+        return None
+
+
+def tool_action(block: Dict[str, Any]) -> str:
+    """Action text for one tool_use block (activity spec §1 table), clipped to ACTION_CAP."""
+    raw = block.get("name")
+    name = raw if isinstance(raw, str) else ""
+    inp = block.get("input")
+    if not isinstance(inp, dict):
+        inp = {}
+    text: Optional[str] = None
+    if name in ("Edit", "MultiEdit"):
+        v = _base(inp.get("file_path"))
+        text = v and "Editing " + v
+    elif name == "NotebookEdit":
+        v = _base(inp.get("notebook_path"))
+        text = v and "Editing " + v
+    elif name == "Write":
+        v = _base(inp.get("file_path"))
+        text = v and "Writing " + v
+    elif name == "Read":
+        v = _base(inp.get("file_path"))
+        text = v and "Reading " + v
+    elif name == "Bash":
+        v = _value(inp.get("description"))
+        if v is None:
+            cmd = inp.get("command")
+            if isinstance(cmd, str) and cmd.strip():
+                v = _value(cmd.strip().splitlines()[0])
+        text = v and "Running " + v
+    elif name == "Grep":
+        v = _value(inp.get("pattern"))
+        text = v and "Searching for " + v
+    elif name == "Glob":
+        v = _value(inp.get("pattern"))
+        text = v and "Finding " + v
+    elif name in ("Agent", "Task"):
+        v = _value(inp.get("description")) or _value(inp.get("subagent_type"))
+        text = v and "Starting agent: " + v
+    elif name == "WebFetch":
+        v = _host(inp.get("url"))
+        text = v and "Reading " + v
+    elif name == "WebSearch":
+        v = _value(inp.get("query"))
+        text = v and "Searching the web: " + v
+    elif name == "TodoWrite":
+        text = "Updating the plan"
+    elif name == "Skill":
+        v = _value(inp.get("skill"))
+        text = v and "Using skill " + v
+    elif name.startswith("mcp__"):
+        server, _, tool = name[5:].partition("__")
+        s, t = _value(server), _value(tool)
+        text = s and t and "Using {}: {}".format(s, t)
+    if not text:
+        text = "Using " + (_value(name) or "tool")
+    return clip_text(text, ACTION_CAP)
+
+
+def _update_action(t: Transcript, kind: Any, msg: Any, ts: Any) -> None:
+    """Advance t's current action for one assistant/user line (activity spec §1)."""
+    when = parse_timestamp(ts) if isinstance(ts, str) else None
+    if when is None:
+        return
+    if kind == "assistant":
+        content = msg.get("content")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        tools = [b for b in blocks if b.get("type") == "tool_use"]
+        if tools:
+            t.action, t.action_time, t.action_from_tool = tool_action(tools[-1]), when, True
+        elif (
+            msg.get("stop_reason") == "end_turn"
+            and blocks
+            and len(blocks) == len(content)
+            and all(b.get("type") == "text" for b in blocks)
+        ):
+            # Only text (a thinking block alongside does not count).
+            t.action = FINISHED if t.is_agent else WAITING
+            t.action_time, t.action_from_tool = when, False
+    elif not t.action_from_tool:
+        # Any user line (prompt or tool results) means Claude is thinking, unless a tool is running.
+        t.action, t.action_time = THINKING, when
+
+
+# ---- live sessions and official limits (activity spec §2, §3) -------------------------------------
+
+
+def _read_json_capped(path: str, cap: int) -> Optional[Dict[str, Any]]:
+    """A regular file's JSON object if it is at most cap bytes and parses; else None. Never raises."""
+    if _is_regular(path) is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read(cap + 1)
+    except OSError:
+        return None
+    if len(data) > cap:
+        return None
+    try:
+        obj = json.loads(data)
+    except (ValueError, RecursionError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def live_sessions(sessions_dir: Path, pid_alive: Callable[[int], bool]) -> List[Dict[str, str]]:
+    """{session_id, name, cwd, status} (strings, "" when absent/invalid) for each <pid>.json whose pid
+    is alive. Same file and pid rules as liveness.live_session_count. Never raises."""
+    try:
+        names = sorted(os.listdir(sessions_dir))
+    except (OSError, TypeError, ValueError):
+        return []
+    out = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            pid = int(name[:-5])
+        except ValueError:
+            continue
+        if pid <= 0:
+            continue
+        try:
+            if not pid_alive(pid):
+                continue
+        except Exception:
+            continue
+        obj = _read_json_capped(os.path.join(str(sessions_dir), name), _SESSION_JSON_CAP) or {}
+        info = {}
+        for key, src in (("session_id", "sessionId"), ("name", "name"), ("cwd", "cwd"), ("status", "status")):
+            v = obj.get(src)
+            info[key] = v if isinstance(v, str) else ""
+        out.append(info)
+    return out
+
+
+def _number(v: Any) -> Optional[float]:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    return f if math.isfinite(f) else None
+
+
+class _Malformed(Exception):
+    pass
+
+
+def _limit_window(v: Any) -> Optional[LimitWindow]:
+    """None when the window is absent; raises _Malformed when it is present but invalid."""
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise _Malformed
+    pct = _number(v.get("used_percentage"))
+    resets = _number(v.get("resets_at"))
+    if pct is None or resets is None or not 0 <= pct <= 100:
+        raise _Malformed
+    return LimitWindow(pct, resets)
+
+
+def read_limits(path: Path, now: float) -> Optional[Limits]:
+    """The official limits file (activity spec §3), or None when missing, oversized or malformed
+    (one bad window spoils the file), or when no window is still running (resets_at > now).
+    Never raises."""
+    obj = _read_json_capped(str(path), LIMITS_CAP)
+    if obj is None:
+        return None
+    version = obj.get("version")
+    updated = _number(obj.get("updated_at"))
+    if isinstance(version, bool) or version != 1 or updated is None:
+        return None
+    try:
+        windows = [_limit_window(obj.get(k)) for k in ("five_hour", "seven_day")]
+    except _Malformed:
+        return None
+    five, seven = [w if w is not None and w.resets_at > now else None for w in windows]
+    if five is None and seven is None:
+        return None
+    return Limits(updated, five, seven)
+
+
 class Store:
     RETENTION: float = 7 * 86400
     DISCOVERY_INTERVAL: float = 3.0
@@ -88,6 +311,9 @@ class Store:
             pid_alive = default_pid_alive
         self.projects_dir = Path(claude_home) / "projects"
         self.sessions_dir = Path(claude_home) / "sessions"
+        from .paths import limits_path
+
+        self.limits_path = limits_path(Path(claude_home))
         self._pid_alive = pid_alive
         self.transcripts = {}
         self.replies = {}  # keyed by message id: streamed replies repeat the same id
@@ -138,6 +364,9 @@ class Store:
                     continue
                 is_agent = os.path.basename(dirpath) == "subagents"
                 t = Transcript(is_agent=is_agent)
+                # activity spec §2: <project-dir>/<sessionId>.jsonl and
+                # <project-dir>/<sessionId>/subagents/agent-*.jsonl share the same session id.
+                t.session_id = os.path.basename(os.path.dirname(dirpath)) if is_agent else name[: -len(".jsonl")]
                 if is_agent:
                     # Swift replaces the extension: agent-x.jsonl -> agent-x.meta.json
                     meta = self._read_meta(path[: -len(".jsonl")] + ".meta.json")
@@ -220,11 +449,14 @@ class Store:
         if t.project == "?" and isinstance(cwd, str):
             t.project = project_name(cwd)  # where the session started
         msg = obj.get("message")
-        if obj.get("type") != "assistant" or not isinstance(msg, dict):
+        kind = obj.get("type")
+        ts = obj.get("timestamp")
+        if kind == "user" or (kind == "assistant" and isinstance(msg, dict)):
+            _update_action(t, kind, msg, ts)
+        if kind != "assistant" or not isinstance(msg, dict):
             return
         u = msg.get("usage")
         model = msg.get("model")
-        ts = obj.get("timestamp")
         if not isinstance(u, dict) or not isinstance(model, str) or model == "<synthetic>":
             return
         if not isinstance(ts, str):
@@ -396,4 +628,57 @@ class Store:
         if range != TimeRange.WEEK:
             frm = now - range.seconds
             s.spans = sorted((x for x in spans if x.end >= frm), key=lambda x: x.start)
+
+        s.now_sessions, s.more_sessions = self._now_block(spans, now)
+        s.limits = read_limits(self.limits_path, now)
         return s
+
+    def _now_block(self, spans: List[Span], now: float) -> Tuple[Tuple[NowSession, ...], int]:
+        """Live sessions with their running subagents (activity spec §2): busy first, then latest
+        action; at most NOW_SESSIONS_MAX, plus the count left out."""
+        infos = live_sessions(self.sessions_dir, self._pid_alive)
+        if not infos:
+            return (), 0
+        mains: Dict[str, Transcript] = {}
+        for t in self.transcripts.values():
+            if t.is_agent or not t.session_id:
+                continue
+            cur = mains.get(t.session_id)
+            if cur is None or (t.mtime or 0.0) > (cur.mtime or 0.0):
+                mains[t.session_id] = t
+        running: Dict[str, List[Span]] = {}
+        for x in spans:
+            at = self.transcripts.get(x.id)
+            if x.running and at is not None and at.session_id:
+                running.setdefault(at.session_id, []).append(x)
+        out: List[NowSession] = []
+        for info in infos:
+            sid = info["session_id"]
+            t = mains.get(sid) if sid else None
+            if info["status"]:
+                busy = info["status"] == "busy"
+            else:
+                busy = t is not None and t.mtime is not None and now - t.mtime < 20
+            cwd = sanitize(info["cwd"])
+            project = project_name(info["cwd"]) if info["cwd"] else (t.project if t is not None else "?")
+            agents = sorted(running.get(sid, []) if sid else [], key=lambda x: x.start, reverse=True)
+            now_agents = []
+            for x in agents[:NOW_AGENTS_MAX]:
+                at = self.transcripts[x.id]
+                now_agents.append(NowAgent(x, at.action, at.action_time))
+            out.append(
+                NowSession(
+                    session_id=sid,
+                    project=sanitize(project) or "?",
+                    name=sanitize(info["name"]),
+                    cwd=cwd,
+                    status=sanitize(info["status"]),
+                    busy=busy,
+                    action=t.action if t is not None else None,
+                    action_time=t.action_time if t is not None else None,
+                    agents=tuple(now_agents),
+                    more_agents=max(0, len(agents) - NOW_AGENTS_MAX),
+                )
+            )
+        out.sort(key=lambda n: (not n.busy, -(n.action_time if n.action_time is not None else float("-inf"))))
+        return tuple(out[:NOW_SESSIONS_MAX]), max(0, len(out) - NOW_SESSIONS_MAX)
