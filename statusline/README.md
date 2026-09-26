@@ -14,8 +14,12 @@ it. It also prints a line for the status line itself.
 - **Nothing is sent anywhere.** The script makes no network calls. It only
   reads stdin and writes one local JSON file.
 - **The data only appears for Pro and Max subscribers, and only after the
-  first assistant reply in a session.** Until then `rate_limits` is simply
-  absent from the input, and the script writes nothing.
+  first API response.** Until then `rate_limits` is simply absent from the
+  input, and the script writes nothing.
+- **Stale data is ignored automatically.** Claudemon checks each window's
+  reset time before showing it, so a `limits.json` left over from an older
+  session is simply skipped once its window has passed, rather than shown
+  as if it were current.
 
 ## Setup
 
@@ -31,6 +35,26 @@ Add this to your `~/.claude/settings.json`:
 ```
 
 Replace `/path/to/claudemon` with wherever you cloned this repository.
+
+### Windows
+
+Claude Code runs status-line commands through Git Bash when it's installed,
+or through PowerShell if it isn't. Either way:
+
+- Use forward slashes in the path, even on Windows (Git Bash and Python
+  both accept them; backslashes need doubling or quoting and are easy to
+  get wrong in JSON).
+- The `python3` command often doesn't exist on Windows. Use `py -3`
+  (the standard Python launcher) if it's available, otherwise `python`.
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "py -3 C:/Users/you/claudemon/statusline/claudemon_statusline.py"
+  }
+}
+```
 
 ### Keeping your existing status line
 
