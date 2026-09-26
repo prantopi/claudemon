@@ -131,7 +131,7 @@ class IntegrationCase(unittest.TestCase):
 
         # ---- live session pids, via an injected pid_alive fake (4242 is the only live one) ----
         sessions = self.home / "sessions"
-        (sessions / "4242.json").write_text("{}")
+        (sessions / "4242.json").write_text('{"sessionId": "session1"}')  # no status: 20 s rule
         (sessions / "7777.json").write_text("{}")  # not alive per the fake
         (sessions / "-3.json").write_text("{}")  # pid <= 0: never even asked
         (sessions / "notapid.json").write_text("{}")  # not an int: skipped

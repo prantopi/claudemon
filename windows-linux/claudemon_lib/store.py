@@ -39,7 +39,6 @@ from .model import (
     family,
     project_name,
 )
-from .liveness import live_session_count
 from .timeparse import parse_timestamp
 
 _FIVE_HOURS = 5 * 3600.0
@@ -71,13 +70,16 @@ def _is_regular(path: str) -> Optional[os.stat_result]:
 
 # ---- current action (activity spec §1) -----------------------------------------------------------
 
-VALUE_CAP = 40  # every untrusted value inserted into an action
-ACTION_CAP = 56  # the whole action
+VALUE_CAP = 40  # every untrusted value inserted into an action; rows.py clips the whole action
 THINKING = "Thinking…"
 WAITING = "Waiting for you"
 FINISHED = "Finished"
+INTERRUPT = "[Request interrupted by user"
 _SESSION_JSON_CAP = 64 * 1024
 LIMITS_CAP = 64 * 1024
+RESET_HORIZON = 8 * 86400  # a limit window never resets further ahead than this
+UPDATED_SLACK = 60.0  # updated_at may be at most this far in the future (clock skew)
+BUSY_SECONDS = 20.0  # the busy fallback when a session's status is missing
 NOW_SESSIONS_MAX = 3
 NOW_AGENTS_MAX = 3
 
@@ -106,7 +108,8 @@ def _host(v: Any) -> Optional[str]:
 
 
 def tool_action(block: Dict[str, Any]) -> str:
-    """Action text for one tool_use block (activity spec §1 table), clipped to ACTION_CAP."""
+    """Action text for one tool_use block (activity spec §1 table). Each inserted value is capped
+    at VALUE_CAP; the whole action is stored in full and clipped only when rows are built (F6)."""
     raw = block.get("name")
     name = raw if isinstance(raw, str) else ""
     inp = block.get("input")
@@ -157,33 +160,67 @@ def tool_action(block: Dict[str, Any]) -> str:
         s, t = _value(server), _value(tool)
         text = s and t and "Using {}: {}".format(s, t)
     if not text:
-        text = "Using " + (_value(name) or "tool")
-    return clip_text(text, ACTION_CAP)
+        v = _value(name)
+        text = "Using " + v if v else "Using a tool"
+    return text
 
 
-def _update_action(t: Transcript, kind: Any, msg: Any, ts: Any) -> None:
-    """Advance t's current action for one assistant/user line (activity spec §1)."""
-    when = parse_timestamp(ts) if isinstance(ts, str) else None
-    if when is None:
+def _only_tool_results(content: Any) -> bool:
+    return (
+        isinstance(content, list)
+        and len(content) > 0
+        and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    )
+
+
+def _interrupted(content: Any, depth: int = 0) -> bool:
+    """True when a user line contains Claude Code's interrupt marker: in string content, in a text
+    block, or inside a tool_result's content (same places as the macOS app)."""
+    if isinstance(content, str):
+        return INTERRUPT in content
+    if not isinstance(content, list) or depth > 1:
+        return False
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        kind = b.get("type")
+        if kind == "text" and isinstance(b.get("text"), str) and INTERRUPT in b["text"]:
+            return True
+        if kind == "tool_result" and _interrupted(b.get("content"), depth + 1):
+            return True
+    return False
+
+
+def _update_action(t: Transcript, kind: Any, msg: Any, ts: Any, meta: Any = False) -> None:
+    """Advance t's current action for one assistant/user line (activity spec §1, amendment A).
+
+    A line without a valid timestamp still updates the action; its time is then unknown (F8)."""
+    if meta is True:
         return
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str) and content.startswith(("<local-command", "<command-")):
+        return  # slash-command noise, compact summaries
+    when = parse_timestamp(ts) if isinstance(ts, str) else None
+    done = FINISHED if t.is_agent else WAITING
     if kind == "assistant":
-        content = msg.get("content")
-        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
-        tools = [b for b in blocks if b.get("type") == "tool_use"]
+        blocks = content if isinstance(content, list) else []
+        tools = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
         if tools:
             t.action, t.action_time, t.action_from_tool = tool_action(tools[-1]), when, True
-        elif (
-            msg.get("stop_reason") == "end_turn"
-            and blocks
-            and len(blocks) == len(content)
-            and all(b.get("type") == "text" for b in blocks)
-        ):
-            # Only text (a thinking block alongside does not count).
-            t.action = FINISHED if t.is_agent else WAITING
-            t.action_time, t.action_from_tool = when, False
-    elif not t.action_from_tool:
-        # Any user line (prompt or tool results) means Claude is thinking, unless a tool is running.
-        t.action, t.action_time = THINKING, when
+            return
+        rest = [b for b in blocks if not (isinstance(b, dict) and b.get("type") == "thinking")]
+        text_only = len(rest) > 0 and all(isinstance(b, dict) and b.get("type") == "text" for b in rest)
+        if text_only and msg.get("stop_reason") == "end_turn":
+            t.action = done
+        else:
+            t.action = THINKING  # thinking only, or text in the middle of a turn
+        t.action_time, t.action_from_tool = when, False
+    elif _interrupted(content):  # checked before the tool_result-only rule
+        t.action, t.action_time, t.action_from_tool = done, when, False
+    elif _only_tool_results(content):
+        return  # the tool just returned: keep the action and its time
+    else:
+        t.action, t.action_time, t.action_from_tool = THINKING, when, False
 
 
 # ---- live sessions and official limits (activity spec §2, §3) -------------------------------------
@@ -263,21 +300,22 @@ def _limit_window(v: Any) -> Optional[LimitWindow]:
 
 
 def read_limits(path: Path, now: float) -> Optional[Limits]:
-    """The official limits file (activity spec §3), or None when missing, oversized or malformed
-    (one bad window spoils the file), or when no window is still running (resets_at > now).
-    Never raises."""
+    """The official limits file (activity spec §3, amendments E and F7), or None when missing,
+    oversized or malformed (one window with wrong types spoils the file), when updated_at is not in
+    (0, now + 60], or when no window counts. A window counts only while now < resets_at <= now + 8
+    days; one outside that range is dropped while the other still counts. Never raises."""
     obj = _read_json_capped(str(path), LIMITS_CAP)
     if obj is None:
         return None
     version = obj.get("version")
     updated = _number(obj.get("updated_at"))
-    if isinstance(version, bool) or version != 1 or updated is None:
+    if isinstance(version, bool) or version != 1 or updated is None or not 0 < updated <= now + UPDATED_SLACK:
         return None
     try:
         windows = [_limit_window(obj.get(k)) for k in ("five_hour", "seven_day")]
     except _Malformed:
         return None
-    five, seven = [w if w is not None and w.resets_at > now else None for w in windows]
+    five, seven = [w if w is not None and now < w.resets_at <= now + RESET_HORIZON else None for w in windows]
     if five is None and seven is None:
         return None
     return Limits(updated, five, seven)
@@ -452,7 +490,7 @@ class Store:
         kind = obj.get("type")
         ts = obj.get("timestamp")
         if kind == "user" or (kind == "assistant" and isinstance(msg, dict)):
-            _update_action(t, kind, msg, ts)
+            _update_action(t, kind, msg, ts, obj.get("isMeta"))
         if kind != "assistant" or not isinstance(msg, dict):
             return
         u = msg.get("usage")
@@ -493,11 +531,12 @@ class Store:
         # claudemon.swift 178-285
         now = time.time() if now is None else now
         s = Snapshot(loaded=True, range=range, now=now)
-        s.live_sessions = live_session_count(self.sessions_dir, self._pid_alive)  # data-flow §6
+        # One listing of ~/.claude/sessions feeds the live count, the busy count and the Now block
+        # (amendment C, F12), so they never disagree.
+        infos = live_sessions(self.sessions_dir, self._pid_alive)
+        s.live_sessions = len(infos)  # data-flow §6
 
         mains = [t for t in self.transcripts.values() if not t.is_agent]
-        busy = sum(1 for t in mains if t.mtime is not None and now - t.mtime < 20)
-        s.busy_sessions = min(s.live_sessions, busy)
         cands = [t for t in mains if t.last_reply is not None]
         if cands:
             cur = max(cands, key=lambda t: t.mtime if t.mtime is not None else float("-inf"))
@@ -629,16 +668,18 @@ class Store:
             frm = now - range.seconds
             s.spans = sorted((x for x in spans if x.end >= frm), key=lambda x: x.start)
 
-        s.now_sessions, s.more_sessions = self._now_block(spans, now)
+        s.now_sessions, s.more_sessions, s.busy_sessions = self._now_block(infos, spans, now)
         s.limits = read_limits(self.limits_path, now)
         return s
 
-    def _now_block(self, spans: List[Span], now: float) -> Tuple[Tuple[NowSession, ...], int]:
+    def _now_block(
+        self, infos: List[Dict[str, str]], spans: List[Span], now: float
+    ) -> Tuple[Tuple[NowSession, ...], int, int]:
         """Live sessions with their running subagents (activity spec §2): busy first, then latest
-        action; at most NOW_SESSIONS_MAX, plus the count left out."""
-        infos = live_sessions(self.sessions_dir, self._pid_alive)
+        action; at most NOW_SESSIONS_MAX, plus the count left out and the busy count over every
+        live session (the same rule as the Now dots, amendment C)."""
         if not infos:
-            return (), 0
+            return (), 0, 0
         mains: Dict[str, Transcript] = {}
         for t in self.transcripts.values():
             if t.is_agent or not t.session_id:
@@ -658,7 +699,7 @@ class Store:
             if info["status"]:
                 busy = info["status"] == "busy"
             else:
-                busy = t is not None and t.mtime is not None and now - t.mtime < 20
+                busy = t is not None and t.mtime is not None and now - t.mtime < BUSY_SECONDS
             cwd = sanitize(info["cwd"])
             project = project_name(info["cwd"]) if info["cwd"] else (t.project if t is not None else "?")
             agents = sorted(running.get(sid, []) if sid else [], key=lambda x: x.start, reverse=True)
@@ -681,4 +722,5 @@ class Store:
                 )
             )
         out.sort(key=lambda n: (not n.busy, -(n.action_time if n.action_time is not None else float("-inf"))))
-        return tuple(out[:NOW_SESSIONS_MAX]), max(0, len(out) - NOW_SESSIONS_MAX)
+        busy_count = sum(1 for n in out if n.busy)
+        return tuple(out[:NOW_SESSIONS_MAX]), max(0, len(out) - NOW_SESSIONS_MAX), busy_count

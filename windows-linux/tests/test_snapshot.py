@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import datetime
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import support  # noqa: F401
 from support import assistant_line, local_ts, make_home, write_lines
@@ -49,9 +50,10 @@ class SnapCase(unittest.TestCase):
         return str(path)
 
     def snap(self, r: TimeRange = TimeRange.HOUR, now: Optional[float] = None,
-             live: List[int] = ()) -> Snapshot:
+             live: List[int] = (), sids: Optional[Dict[int, str]] = None) -> Snapshot:
         for pid in live:
-            (self.home / "sessions" / ("%d.json" % pid)).write_text("{}")
+            sid = (sids or {}).get(pid)
+            (self.home / "sessions" / ("%d.json" % pid)).write_text(json.dumps({"sessionId": sid}) if sid else "{}")
         now = self.now if now is None else now
         store = Store(claude_home=self.home, pid_alive=lambda pid: pid in live)
         store.refresh(now=now, force_discover=True)
@@ -276,11 +278,14 @@ class TestAgentsAndSessions(SnapCase):
         import os
         os.utime(self.proj / "c.jsonl", (NOW - 5, NOW - 5))
         self.reply("x/subagents/agent-z.jsonl", NOW - 5, mtime=NOW - 1)  # agents never count as busy
-        s = self.snap(live=[11, 12, 13])
+        sids = {11: "a", 12: "b", 13: "c"}
+        s = self.snap(live=[11, 12, 13], sids=sids)
         self.assertEqual(s.live_sessions, 3)
+        # No status in the sessions json: the 20 s fallback on each live session's own transcript.
         self.assertEqual(s.busy_sessions, 2)  # b and c changed in the last 20 s
         self.assertEqual((s.context, s.context_project), (3120, "beta"))
-        self.assertEqual(self.snap(live=[11]).busy_sessions, 1)  # capped by live sessions
+        self.assertEqual(self.snap(live=[11], sids=sids).busy_sessions, 0)  # only live sessions count
+        self.assertEqual(self.snap(live=[12, 14], sids=sids).busy_sessions, 1)  # 14: no sessionId
 
     def test_snapshot_metadata(self) -> None:
         s = self.snap(TimeRange.FIVE_HOURS)

@@ -39,7 +39,9 @@ TITLE_DOTS: List[Seg] = [
 
 SPARKS = "▁▂▃▄▅▆▇█"
 
-ACTION_CAP = 56  # activity spec §1: the whole action, clipped at display time
+# Activity amendment B/F6: actions are stored in full and clipped only here.
+SESSION_ACTION_CAP = 48
+AGENT_ACTION_CAP = 40
 
 
 def _label(text: str) -> Seg:
@@ -69,7 +71,7 @@ def build_rows(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> 
         ]
     ses_tip = [
         "Sessions",
-        f"{snap.live_sessions} running now, {snap.busy_sessions} active in the last 20s",
+        f"{snap.live_sessions} running now, {snap.busy_sessions} busy",
         f"Latest conversation: {fmt.exact(snap.context)} tokens of context ({snap.context_project})"
         if snap.context > 0
         else "No conversation yet",
@@ -77,7 +79,7 @@ def build_rows(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> 
     lines.append(Line(ses_segs, ses_tip))
 
     # 1b. "Now" block: live sessions with their running agents (activity spec §2)
-    lines += now_lines(snap, now, spin_phase)
+    lines += now_lines(snap, anim, now, spin_phase)
 
     # 2. Tokens [claudemon.swift 524-534] and 3. in/out line [535-537]
     usage_tip = [
@@ -213,11 +215,12 @@ def _agent_tip(a: Span, now: float) -> List[str]:
     ]
 
 
-def now_lines(snap: Snapshot, now: float, spin_phase: bool) -> List[Line]:
-    """The "Now" block (activity spec §2): one line per live session, each followed by its running
-    subagents as a small tree. Empty when no session is live."""
+def now_lines(snap: Snapshot, anim: Animator, now: float, spin_phase: bool) -> List[Line]:
+    """The "Now" block (activity spec §2 and F1-F6): one line per live session, each followed by
+    its running subagents (newest first) as a small tree. Empty when no session is live."""
     out: List[Line] = []
     for ses in snap.now_sessions:
+        # F5: project in the normal text colour, action and elapsed dim; busy only colours the dot.
         segs = [
             Seg("  "),
             Seg("● ", "warn" if ses.busy else "dim"),
@@ -230,8 +233,7 @@ def now_lines(snap: Snapshot, now: float, spin_phase: bool) -> List[Line]:
             tip.append(ses.cwd)
         tip.append(f"Status: {ses.status or ('busy' if ses.busy else 'idle')}")
         if ses.action is not None:
-            segs.append(Seg(" · ", "dim"))
-            segs.append(Seg(fmt.clip_text(ses.action, ACTION_CAP), "fg" if ses.busy else "dim"))
+            segs.append(Seg(" · " + fmt.clip_text(ses.action, SESSION_ACTION_CAP), "dim"))
             tip.append(ses.action)
         if ses.action_time is not None:
             segs.append(Seg(" · " + fmt.duration(now - ses.action_time), "dim"))
@@ -245,14 +247,14 @@ def now_lines(snap: Snapshot, now: float, spin_phase: bool) -> List[Line]:
             asegs = [
                 Seg("    " + branch, "dim"),
                 Seg("◐ " if spin_phase else "◓ ", "warn"),
-                Seg(fmt.clip_text(fmt.sanitize(a.type), 20) + ":", "text"),
+                Seg(fmt.clip_text(fmt.sanitize(a.type), 20) + (":" if ag.action is not None else ""), "text"),
             ]
             atip = _agent_tip(a, now)
-            if ag.action is not None:
-                asegs.append(Seg(" " + fmt.clip_text(ag.action, ACTION_CAP), "dim"))
-                atip.append(ag.action)
+            if ag.action is not None:  # F2: no ": <action>" without an action
+                asegs.append(Seg(" " + fmt.clip_text(ag.action, AGENT_ACTION_CAP), "dim"))
+                atip.append(f"Now: {ag.action}")
             asegs.append(Seg(" · " + fmt.duration(now - a.start), "warn"))
-            out.append(Line(asegs, atip))
+            out.append(Line(asegs, atip, anim.fade(a.id, now)))
         if ses.more_agents > 0:
             out.append(Line([Seg(f"    └─ +{ses.more_agents} more", "dim")]))
     if snap.more_sessions > 0:
@@ -311,7 +313,7 @@ def limits_line(limits: Limits, now: float) -> Line:
             Seg(f"{pct}%", _pct_role(pct), True),
             Seg(" · resets " + _local(w.resets_at, when), "dim"),
         ]
-        tip.append(f"{long_name}: {w.used_percentage:g}% used · resets {_long_reset(w.resets_at)}")
+        tip.append(f"{long_name}: {w.used_percentage:g}% used, resets {_long_reset(w.resets_at)}")
     return Line(segs, tip)
 
 

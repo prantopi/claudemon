@@ -206,7 +206,19 @@ _SMOKE = textwrap.dedent(
         assert str(style[0]) == "plain", style
         assert not root.tk.call("wm", "overrideredirect", app.win._w)
         assert app.view.transparent_corners and app.view.true_radius
+    # Wait for the worker's first snapshot: it changes the full-mode rows ("Reading Claude Code
+    # logs..." -> loaded), so a height recorded before it arrives would race the toggles below.
+    import time
+    deadline = time.monotonic() + 20
+    while not app.view.snap.loaded:
+        assert time.monotonic() < deadline, "no snapshot from the worker"
+        root.update()
+        time.sleep(0.02)
+    root.update()
+    app._resize(force=True)
+    root.update_idletasks()
     full_h = app._height
+    assert full_h == app.view.fitting_size()[1], (full_h, app.view.fitting_size())
     # Double-click on the title toggles compact (ui-spec.md §9), and back.
     def double_click(x, y):
         for _ in range(2):
@@ -217,7 +229,9 @@ _SMOKE = textwrap.dedent(
     double_click(200, 5)
     assert app.view.compact and app._height == app.metrics.title_h, (app.view.compact, app._height)
     double_click(200, 5)
-    assert not app.view.compact and app._height == full_h
+    root.update_idletasks()
+    assert not app.view.compact, "compact did not toggle back"
+    assert app._height == app.view.fitting_size()[1] == full_h, (app._height, app.view.fitting_size(), full_h)
     # Motion sets the hover point; Leave clears it.
     c.event_generate("<Motion>", x=50, y=60)
     assert app.view.mouse == (50, 60), app.view.mouse
